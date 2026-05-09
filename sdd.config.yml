@@ -1,0 +1,41 @@
+project_name: speckit
+repo: Sadil08/Spec-Driven-Development
+mode: brownfield-no-specs
+primary_language: python
+description: Spec-driven development CLI — automate bug fixes and features using structured
+  spec files and Claude AI
+paths:
+  specs: ./specs
+  runs: ./runs
+  src: ./src
+  tests: ./tests
+agent:
+  model: claude-sonnet-4-6
+  judge_threshold: 0.85
+  max_judge_iterations: 5
+  max_spec_read_files: 5
+vector_db:
+  provider: none
+  index_name: speckit-specs
+  connection_url: ''
+github:
+  default_branch: main
+  require_spec_update: true
+  bug_labels:
+  - bug
+  - fix-needed
+  feature_labels:
+  - feature
+  - enhancement
+testing:
+  backend_runner: pytest
+  frontend_runner: vitest
+  api_test_tool: curl
+  coverage_threshold: 80
+notifications:
+  slack_channel: '#engineering'
+  slack_webhook_url: ''
+  notify_on:
+  - pr_opened
+  - judge_failed
+  - tests_failed

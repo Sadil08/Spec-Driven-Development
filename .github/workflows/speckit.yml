@@ -1,0 +1,33 @@
+name: speckit
+
+on:
+  issues:
+    types: [opened, labeled]
+
+jobs:
+  speckit:
+    runs-on: ubuntu-latest
+    if: |
+      contains(github.event.issue.labels.*.name, 'bug') ||
+      contains(github.event.issue.labels.*.name, 'fix-needed') ||
+      contains(github.event.issue.labels.*.name, 'feature') ||
+      contains(github.event.issue.labels.*.name, 'enhancement')
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install speckit
+        run: pip install speckit  # TODO: replace with your install method
+
+      - name: Run speckit
+        env:
+          ANTHROPIC_API_KEY: ${{{{ secrets.ANTHROPIC_API_KEY }}}}
+          GITHUB_TOKEN: ${{{{ secrets.GITHUB_TOKEN }}}}
+          SPECKIT_VECTOR_DB_URL: ${{{{ secrets.SPECKIT_VECTOR_DB_URL }}}}
+        run: |
+          speckit run --issue ${{{{ github.event.issue.number }}}}
