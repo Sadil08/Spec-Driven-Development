@@ -1,92 +1,48 @@
----
-project: speckit
-version: 0.1.0
-last_updated: 2026-05-09
-mode: brownfield-no-specs
----
+# speckit — Architecture
 
-# Architecture overview
-
-## Purpose
-speckit is a spec-driven development CLI that automates bug-fix and feature workflows
-using Claude AI. It reads structured spec files to understand a codebase without
-scanning every source file, then uses a judge loop to ensure all proposed changes
-respect the project's architecture and security rules before any code is written.
-
-## Core principles
-1. Spec-first: agents read spec files, not raw source code — keeps token cost low
-2. Judge before code: no code is written until a spec is approved by the judge loop
-3. Config-driven: all behaviour comes from sdd.config.yml — no hardcoded values
-4. Fail loudly: missing API keys, config errors, and bad commands surface immediately
-5. No secrets in code: all credentials via environment variables loaded from .env
-6. Human in the loop: agents never auto-merge; humans always review and approve PRs
-
-## System design
-CLI tool written in Python with Typer. User runs `speckit <command>` in a project
-directory. Commands read sdd.config.yml, load .env, and orchestrate agents that
-call the Claude API. All run artifacts (classification, bug report, test plan) are
-written to the runs/ directory as markdown files for human review.
+## Overview
+Speckit is a Python-based Command Line Interface (CLI) tool designed to facilitate Spec-Driven Development. It provides commands to initialize, scan, build, run, and index project specifications, aiming to guide developers through the process of building software based on defined specifications.
 
 ## Tech stack
-| Layer       | Technology          | Version  | Reason chosen                        |
-|-------------|---------------------|----------|--------------------------------------|
-| CLI         | Typer               | 0.12+    | Type-safe, auto-help, clean UX       |
-| UI          | Rich                | 13+      | Terminal panels, tables, progress     |
-| AI          | Anthropic SDK       | 0.28+    | Claude claude-sonnet-4-6 for agents  |
-| Config      | Pydantic v2         | 2.7+     | Validated config models              |
-| Config file | PyYAML              | 6+       | sdd.config.yml parsing               |
-| HTTP        | httpx               | 0.27+    | GitHub REST API calls                |
-| Env vars    | python-dotenv       | 1.0+     | Load .env without shell exports      |
-| Vector DB   | local JSON (BM25)   | built-in | Zero-dep local index, Supabase opt.  |
-| Packaging   | setuptools          | 68+      | pyproject.toml, editable installs    |
-
-## Runtime environment
-- OS: Ubuntu 22.04 (dev), any Linux/macOS (users)
-- Python: 3.11+
-- Package manager: pip / uv
-- Virtualenv: .venv/ (not committed)
-
-## Design patterns in use
-- Command pattern: each CLI command is a standalone function in commands/
-- Adapter pattern: GitHub, local index, Supabase all behind the same interface
-- Pipeline pattern: BugFixPipeline orchestrates all stages in order
-- Strategy pattern: vector_db.py auto-selects adapter based on config + env vars
-- Prompt override: agents check .speckit/prompts/{name}.md before using defaults
-
-## Forbidden patterns
-- No direct Claude API calls outside speckit/core/agents.py
-- No hardcoded API keys, tokens, or credentials anywhere in source
-- No auto-merging PRs — humans always review before merge
-- No shell commands in agent code except via ShellAdapter with allowlist
-- No reading from .env directly — always via os.environ after dotenv.load_dotenv()
-- No writing outside runs/ and specs/ directories during a pipeline run
+| Layer | Technology |
+|-----------|-----------|
+| Language | Python |
+| Framework | Typer (for CLI), Rich (for console output) |
+| Database | None observed |
+| Authentication | GitHub Token (for GitHubAdapter) |
+| Testing | None observed |
+| Infrastructure | None observed |
 
 ## Module map
-| Module                  | Responsibility                       | Spec file                    |
-|-------------------------|--------------------------------------|------------------------------|
-| cli                     | Entry point, command registration    | specs/modules/cli.md         |
-| commands                | One file per CLI command             | specs/modules/commands.md    |
-| core/agents             | All Claude API calls                 | specs/modules/agents.md      |
-| core/judge              | Judge loop orchestration             | specs/modules/agents.md      |
-| core/config             | Config loading + validation          | specs/modules/config.md      |
-| core/spec_parser        | Parse spec markdown files            | specs/modules/spec-parser.md |
-| adapters/github         | GitHub REST API                      | specs/modules/adapters.md    |
-| adapters/local_index    | BM25 local index                     | specs/modules/adapters.md    |
-| adapters/supabase_index | Supabase pgvector                    | specs/modules/adapters.md    |
-| adapters/vector_db      | Adapter factory + search             | specs/modules/adapters.md    |
-| adapters/shell          | Safe test runner                     | specs/modules/adapters.md    |
-| modes/bug_fix           | Mode B: bug-fix pipeline             | specs/modules/pipeline.md    |
-| templates               | Spec file templates used by init     | specs/modules/templates.md   |
+| Module | Responsibility |
+|--------|---------------|
+| adapters | Provides interfaces to external services, such as GitHub. |
+| commands | Implements the core functionality exposed through the CLI. |
+| core | Contains fundamental logic and data structures for speckit. |
+| modes | Defines different operational modes or states for speckit. |
+| prompts | Handles user interaction and prompt generation. |
+| templates | Manages project or specification templates. |
 
-## Security baseline
-- Auth model: no user auth in the CLI itself — credentials are env vars only
-- Secrets: ANTHROPIC_API_KEY, GITHUB_TOKEN loaded from .env, never committed
-- Shell adapter: allowlist of permitted test runner commands only
-- No user-supplied strings are executed as shell commands
-- GitHub token scope: only `repo` (read issues, create branches/PRs)
+## Architecture principles
+- **Modularity**: The project is divided into distinct modules (adapters, commands, core, etc.), each with a specific responsibility, promoting separation of concerns.
+- **CLI-first Design**: The primary interface is a command-line tool built using Typer, with commands clearly defined and exposed.
+- **External Service Abstraction**: The `adapters` module abstracts interactions with external services like GitHub, isolating this logic.
+- **Rich Console Output**: The `rich` library is used extensively for enhanced and user-friendly console output, including colored text and formatting.
+- **Data-Centricity (Implicit)**: The presence of dataclasses (e.g., `Issue` in `github.py`) suggests a focus on representing data structures clearly.
+- **Command Stubbing**: Commands like `build_command` are present but marked as "coming in Phase 4," indicating a phased development approach.
+- **Environment Variable Configuration**: Configuration for external services (e.g., GitHub token and repo) is expected to be managed via environment variables.
 
-## Error handling contract
-- Missing ANTHROPIC_API_KEY → EnvironmentError with setup instructions
-- Missing sdd.config.yml → FileNotFoundError telling user to run speckit init
-- Judge threshold not met → RunResult.approved=False, human review message
-- Pipeline failure → FAILED.md written to run directory with full log
+## Cross-cutting concerns
+- Logging: No explicit logging framework is observed. Console output is handled by the `rich.console.Console` object.
+- Error handling: No explicit error handling strategies are detailed in the provided snippets. Standard Python exceptions are likely used.
+- Configuration: Configuration for external services, specifically the GitHub adapter, is managed through environment variables (`GITHUB_TOKEN`, `GITHUB_REPO`).
+- Testing: No test files or testing frameworks are visible in the provided snippets.
+
+## Security model
+- Authentication: For the `GitHubAdapter`, authentication is handled via a `GITHUB_TOKEN` environment variable.
+- Authorisation: No explicit authorization mechanisms are observed beyond what the GitHub token might provide.
+- Secrets management: Secrets like the `GITHUB_TOKEN` are expected to be managed via environment variables.
+- Input validation: Basic type hinting is used for command arguments (e.g., `path: str`). Further input validation is not explicitly detailed.
+
+## Data flow (top level)
+User interaction begins with the `speckit` CLI. Typer parses the command-line arguments and dispatches to the appropriate command function (e.g., `init_command`, `scan_command`). These command functions, located in the `commands` module, orchestrate the core logic, potentially interacting with other modules like `core` for data processing or `adapters` for external service calls. User feedback and results are displayed to the console using the `rich` library.

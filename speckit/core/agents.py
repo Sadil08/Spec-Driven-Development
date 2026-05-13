@@ -1,8 +1,8 @@
 """
-Claude API agents — one function per pipeline stage.
+Claude/Gemini agents — one function per pipeline stage.
 
-Each agent receives only the context it needs (token budget control).
-System prompts can be overridden by placing a .md file in .speckit/prompts/.
+Backend is selected automatically from env vars (see _get_backend).
+System prompts can be overridden via .speckit/prompts/{name}.md.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from speckit.core.config import SpeckitConfig
 
 
-# ── data models ───────────────────────────────────────────────────────────────
+# ── output models ─────────────────────────────────────────────────────────────
 
 class Classification(BaseModel):
     issue_type: str          # "bug" | "feature" | "unclear"
@@ -35,46 +35,179 @@ class JudgeScore(BaseModel):
     feedback: str
 
 
+# ── backend abstraction ───────────────────────────────────────────────────────
+
+class _AnthropicBackend:
+    def __init__(self, client, model: str):
+        self._client = client
+        self.model = model
+
+    def call(self, system: str, user: str, max_tokens: int) -> str:
+        try:
+            resp = self._client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                system=system.strip(),
+                messages=[{"role": "user", "content": user.strip()}],
+            )
+        except anthropic.BadRequestError as e:
+            msg = str(e)
+            if "credit balance is too low" in msg or "billing" in msg.lower():
+                raise RuntimeError(
+                    "Anthropic API credits exhausted.\n"
+                    "  Top up at console.anthropic.com/billing.\n"
+                    "  Or switch to free Gemini: set GEMINI_VERTEX=true in .env"
+                ) from None
+            raise
+        except anthropic.AuthenticationError:
+            raise RuntimeError(
+                "Anthropic API key invalid. "
+                "Fix at console.anthropic.com/api-keys."
+            ) from None
+        return resp.content[0].text.strip()
+
+
+class _GeminiBackend:
+    def __init__(self, client, model: str):
+        self._client = client
+        self.model = model
+
+    def call(self, system: str, user: str, max_tokens: int) -> str:
+        from google.genai import types  # type: ignore[import]
+        resp = self._client.models.generate_content(
+            model=self.model,
+            contents=user.strip(),
+            config=types.GenerateContentConfig(
+                system_instruction=system.strip(),
+                max_output_tokens=max_tokens,
+                temperature=0.3,
+            ),
+        )
+        return resp.text.strip()
+
+
+def _get_backend(config: "SpeckitConfig") -> _AnthropicBackend | _GeminiBackend:
+    """
+    Return the best available LLM backend.
+
+    Detection order (first match wins):
+      1. GEMINI_VERTEX=true          → Gemini 2.0 Flash on Vertex AI
+      2. GEMINI_API_KEY              → Gemini via Google AI Studio (free tier)
+      3. ANTHROPIC_VERTEX_PROJECT_ID → Claude on Vertex AI
+      4. ANTHROPIC_API_KEY           → Anthropic direct API
+    """
+    from google import genai as ggenai  # type: ignore[import]
+
+    # 1. Gemini on Vertex (reuses GOOGLE_APPLICATION_CREDENTIALS)
+    if os.environ.get("GEMINI_VERTEX", "").lower() in ("true", "1", "yes"):
+        project = (
+            os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID", "")
+            or os.environ.get("GEMINI_VERTEX_PROJECT_ID", "")
+        )
+        if not project:
+            raise EnvironmentError(
+                "GEMINI_VERTEX=true requires a project ID.\n"
+                "  Add to .env: ANTHROPIC_VERTEX_PROJECT_ID=sdd-1-495816"
+            )
+        region = os.environ.get("GEMINI_VERTEX_REGION", "us-central1")
+        client = ggenai.Client(vertexai=True, project=project, location=region)
+        model = os.environ.get("GEMINI_MODEL", "publishers/google/models/gemini-2.5-flash-lite")
+        return _GeminiBackend(client, model)
+
+    # 2. Gemini via Google AI Studio (free API key)
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if gemini_key:
+        client = ggenai.Client(api_key=gemini_key)
+        model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+        return _GeminiBackend(client, model)
+
+    # 3. Claude on Vertex AI
+    vertex_project = os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID", "")
+    if vertex_project:
+        try:
+            from anthropic import AnthropicVertex
+        except ImportError:
+            raise RuntimeError("Run: pip install 'anthropic[vertex]'") from None
+        region = os.environ.get("ANTHROPIC_VERTEX_REGION", "us-east5")
+        client = AnthropicVertex(project_id=vertex_project, region=region)
+        _MAP = {
+            "claude-sonnet-4-6": "claude-sonnet-4-5@20251001",
+            "claude-haiku-4-5":  "claude-haiku-4-5@20251001",
+        }
+        model = _MAP.get(config.agent.model, config.agent.model)
+        return _AnthropicBackend(client, model)
+
+    # 4. Anthropic direct API
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if key and key not in ("paste-your-key-here", "sk-ant-..."):
+        return _AnthropicBackend(anthropic.Anthropic(api_key=key), config.agent.model)
+
+    raise EnvironmentError(
+        "No LLM credentials found. Add one of these to .env:\n\n"
+        "  Free — Gemini on your existing Vertex project:\n"
+        "    GEMINI_VERTEX=true\n"
+        "    ANTHROPIC_VERTEX_PROJECT_ID=sdd-1-495816\n\n"
+        "  Free — Gemini via Google AI Studio:\n"
+        "    GEMINI_API_KEY=AIza...  (get key at aistudio.google.com)\n\n"
+        "  Paid — Anthropic direct API:\n"
+        "    ANTHROPIC_API_KEY=sk-ant-..."
+    )
+
+
 # ── shared helpers ────────────────────────────────────────────────────────────
 
-def _get_client(config: "SpeckitConfig") -> anthropic.Anthropic:
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not key:
-        raise EnvironmentError(
-            "ANTHROPIC_API_KEY not set. Add it to .env:\n  ANTHROPIC_API_KEY=sk-ant-..."
-        )
-    return anthropic.Anthropic(api_key=key)
-
-
-def _load_prompt_override(name: str, project_root: Path) -> str | None:
-    """Load a user-defined prompt from .speckit/prompts/{name}.md if it exists."""
+def _prompt_override(name: str, project_root: Path) -> str | None:
     p = project_root / ".speckit" / "prompts" / f"{name}.md"
     return p.read_text(encoding="utf-8") if p.exists() else None
 
 
 def _strip_fences(text: str) -> str:
-    """Remove markdown code fences from LLM output before JSON parsing."""
+    import re
     text = text.strip()
+    # Strip ```json ... ``` or ``` ... ``` fences
     if text.startswith("```"):
         text = text.split("\n", 1)[1] if "\n" in text else text[3:]
         text = text.rsplit("```", 1)[0]
+        return text.strip()
+    # Extract first {...} block if there's surrounding prose
+    m = re.search(r'\{.*\}', text, re.DOTALL)
+    if m:
+        return m.group(0)
     return text.strip()
 
 
-def _call(
-    client: anthropic.Anthropic,
-    model: str,
-    system: str,
-    user: str,
-    max_tokens: int,
-) -> str:
-    response = client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=system.strip(),
-        messages=[{"role": "user", "content": user.strip()}],
+def _parse_json_safe(text: str) -> dict:
+    """Parse JSON from LLM output, tolerating common formatting issues."""
+    import re
+    cleaned = _strip_fences(text)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+    # Replace literal newlines inside strings with \\n
+    # Find all string values and escape newlines within them
+    fixed = re.sub(
+        r'"((?:[^"\\]|\\.)*)"',
+        lambda m: '"' + m.group(1).replace('\n', '\\n').replace('\r', '') + '"',
+        cleaned,
     )
-    return response.content[0].text.strip()
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+    # Last resort: extract key fields individually
+    result: dict = {}
+    for key in ("score", "approved", "gaps", "feedback",
+                "issue_type", "severity", "affected_modules", "search_keywords", "summary"):
+        m = re.search(rf'"{key}"\s*:\s*("(?:[^"\\]|\\.)*"|\[.*?\]|true|false|[\d.]+)', cleaned, re.DOTALL)
+        if m:
+            try:
+                result[key] = json.loads(m.group(1))
+            except Exception:
+                result[key] = m.group(1).strip('"')
+    if result:
+        return result
+    raise ValueError(f"Could not parse JSON from LLM response: {text[:200]}")
 
 
 # ── agent 1: classify ─────────────────────────────────────────────────────────
@@ -85,16 +218,10 @@ def classify_issue(
     config: "SpeckitConfig",
     project_root: Path,
 ) -> Classification:
-    """
-    Classify a GitHub issue — extract type, affected modules, severity,
-    and search keywords for spec lookup.
+    """~500 input / ~200 output tokens."""
+    backend = _get_backend(config)
 
-    Input tokens:  ~500
-    Output tokens: ~200
-    """
-    client = _get_client(config)
-
-    system = _load_prompt_override("classify", project_root) or (
+    system = _prompt_override("classify", project_root) or (
         "You are a software issue classifier. "
         "Read the GitHub issue and return compact, precise JSON. "
         "search_keywords must be terms likely to appear in spec file content. "
@@ -115,8 +242,8 @@ Return JSON:
   "summary": "one sentence describing the issue"
 }}"""
 
-    raw = _call(client, config.agent.model, system, user, max_tokens=400)
-    return Classification(**json.loads(_strip_fences(raw)))
+    raw = backend.call(system, user, max_tokens=800)
+    return Classification(**_parse_json_safe(raw))
 
 
 # ── agent 2: draft bug report ────────────────────────────────────────────────
@@ -131,13 +258,8 @@ def draft_bug_report(
     config: "SpeckitConfig",
     project_root: Path,
 ) -> str:
-    """
-    Draft a full bug report markdown document.
-
-    Input tokens:  ~3 000
-    Output tokens: ~2 000
-    """
-    client = _get_client(config)
+    """~3 000 input / ~2 000 output tokens."""
+    backend = _get_backend(config)
 
     specs_text = "\n\n---\n\n".join(
         f"### {s.get('path', '')} (module: {s.get('module', '')})\n"
@@ -150,7 +272,7 @@ def draft_bug_report(
         for path, content in source_file_contents.items()
     ) or "(no source files resolved)"
 
-    system = _load_prompt_override("draft_bug_report", project_root) or """
+    system = _prompt_override("draft_bug_report", project_root) or """
 You are a spec-driven development agent writing a bug report.
 RULES:
 - Root cause MUST reference a specific file and line number.
@@ -234,7 +356,7 @@ Write the complete bug report in this exact structure:
 - [ ] [spec file] — [what to update]
 """
 
-    return _call(client, config.agent.model, system, user, max_tokens=2500)
+    return backend.call(system, user, max_tokens=2500)
 
 
 # ── agent 3: judge ────────────────────────────────────────────────────────────
@@ -246,16 +368,10 @@ def judge_bug_report(
     config: "SpeckitConfig",
     project_root: Path,
 ) -> JudgeScore:
-    """
-    Score a bug report 0–1 against architecture + security specs.
-    Returns score, approval, gaps, and actionable feedback.
+    """~2 500 input / ~400 output tokens."""
+    backend = _get_backend(config)
 
-    Input tokens:  ~2 500
-    Output tokens: ~400
-    """
-    client = _get_client(config)
-
-    system = _load_prompt_override("judge", project_root) or (
+    system = _prompt_override("judge", project_root) or (
         "You are a senior software architect reviewing an AI-generated bug report. "
         "Be rigorous. Return JSON only."
     )
@@ -288,8 +404,8 @@ Return JSON only:
 
 Set approved=true only if score >= {config.agent.judge_threshold}"""
 
-    raw = _call(client, config.agent.model, system, user, max_tokens=500)
-    data = json.loads(_strip_fences(raw))
+    raw = backend.call(system, user, max_tokens=1500)
+    data = _parse_json_safe(raw)
     data["approved"] = float(data.get("score", 0)) >= config.agent.judge_threshold
     return JudgeScore(**data)
 
@@ -302,15 +418,10 @@ def refine_bug_report(
     config: "SpeckitConfig",
     project_root: Path,
 ) -> str:
-    """
-    Improve a bug report based on judge feedback.
+    """~2 500 input / ~2 000 output tokens."""
+    backend = _get_backend(config)
 
-    Input tokens:  ~2 500
-    Output tokens: ~2 000
-    """
-    client = _get_client(config)
-
-    system = _load_prompt_override("refine", project_root) or """
+    system = _prompt_override("refine", project_root) or """
 You are a spec-driven development agent improving a bug report based on reviewer feedback.
 RULES:
 - Address every gap listed — do not skip any.
@@ -332,7 +443,7 @@ RULES:
 
 Return the complete improved bug report (maintain all sections, improve weak ones)."""
 
-    return _call(client, config.agent.model, system, user, max_tokens=2500)
+    return backend.call(system, user, max_tokens=2500)
 
 
 # ── agent 5: test plan ────────────────────────────────────────────────────────
@@ -342,15 +453,10 @@ def write_test_plan(
     config: "SpeckitConfig",
     project_root: Path,
 ) -> str:
-    """
-    Generate a concrete test plan from an approved bug report.
+    """~2 000 input / ~1 500 output tokens."""
+    backend = _get_backend(config)
 
-    Input tokens:  ~2 000
-    Output tokens: ~1 500
-    """
-    client = _get_client(config)
-
-    system = _load_prompt_override("test_plan", project_root) or """
+    system = _prompt_override("test_plan", project_root) or """
 You are a QA engineer writing tests for a bug fix.
 RULES:
 - Every test must have specific inputs and expected outputs.
@@ -398,4 +504,143 @@ curl -X [METHOD] [url] \\
 - Total: [n] | Passed: - | Failed: -
 """
 
-    return _call(client, config.agent.model, system, user, max_tokens=1800)
+    return backend.call(system, user, max_tokens=1800)
+
+
+# ── agent 6: generate module spec (scan) ─────────────────────────────────────
+
+def generate_module_spec(
+    module_name: str,
+    file_contents: dict[str, str],
+    language: str,
+    config: "SpeckitConfig",
+    project_root: Path,
+) -> str:
+    """~3 000 input / ~1 500 output tokens. Used by speckit scan."""
+    backend = _get_backend(config)
+
+    system = _prompt_override("scan_module", project_root) or """
+You are a spec writer analysing existing source code.
+RULES:
+- Be precise — reference real function/class names you see in the code.
+- Do NOT invent behaviour that isn't in the files.
+- Keep every section concise (2-5 bullet points each).
+- Return only the markdown document (frontmatter + body), no preamble.
+"""
+
+    files_text = "\n\n".join(
+        f"### {path}\n```\n{content[:1000]}\n```"
+        for path, content in list(file_contents.items())[:8]
+    )
+
+    user = f"""Analyse the source files below and write a spec for the **{module_name}** module of a {language} project.
+
+## Source files
+{files_text}
+
+---
+Return this exact structure (fill every section):
+
+---
+module: {module_name}
+affects: []
+files: {list(file_contents.keys())}
+---
+
+# {module_name.replace("-", " ").title()} Module
+
+## Purpose
+[1-3 sentences: what this module does and why it exists]
+
+## Public interfaces
+[Bullet list of key public functions / classes / endpoints with brief description]
+
+## Data flow
+[How data enters and leaves this module]
+
+## Architecture principles
+[Rules this module must follow — constraints, invariants, non-obvious behaviour]
+
+## Dependencies
+- Internal: [other modules it imports]
+- External: [third-party packages]
+
+## Known gaps / TODOs
+[Things missing or unclear from the source — write "none" if all good]
+"""
+
+    return backend.call(system, user, max_tokens=1800)
+
+
+# ── agent 7: generate architecture spec (scan) ───────────────────────────────
+
+def generate_architecture_spec(
+    project_name: str,
+    language: str,
+    modules_summary: str,
+    sample_files: dict[str, str],
+    config: "SpeckitConfig",
+    project_root: Path,
+) -> str:
+    """~3 000 input / ~2 000 output tokens. Used by speckit scan."""
+    backend = _get_backend(config)
+
+    system = _prompt_override("scan_architecture", project_root) or """
+You are a senior software architect writing the top-level architecture spec for an existing project.
+RULES:
+- Ground every statement in the actual code you see — do not add fictional features.
+- Infer architecture principles from the code patterns you observe.
+- Return only the markdown document, no preamble.
+"""
+
+    sample_text = "\n\n".join(
+        f"### {path}\n```\n{content[:600]}\n```"
+        for path, content in list(sample_files.items())[:6]
+    )
+
+    user = f"""Project: **{project_name}** ({language})
+
+## Module summary
+{modules_summary}
+
+## Representative source files
+{sample_text}
+
+---
+Write specs/architecture.md:
+
+# {project_name} — Architecture
+
+## Overview
+[2-3 sentences: what the project does]
+
+## Tech stack
+| Layer | Technology |
+|-------|-----------|
+[rows for: language, framework, DB, auth, testing, infra]
+
+## Module map
+| Module | Responsibility |
+|--------|---------------|
+[one row per module from the module summary]
+
+## Architecture principles
+[5-8 bullet points: the key design rules observed in the code]
+
+## Cross-cutting concerns
+- Logging: [approach]
+- Error handling: [approach]
+- Configuration: [how config/env vars are managed]
+- Testing: [test strategy]
+
+## Security model
+- Authentication: [mechanism]
+- Authorisation: [mechanism]
+- Secrets management: [env vars / vault / etc.]
+- Input validation: [where and how]
+
+## Data flow (top level)
+[Brief description of the main request/data path through the system]
+"""
+
+    return backend.call(system, user, max_tokens=2000)

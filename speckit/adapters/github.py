@@ -33,14 +33,30 @@ class GitHubAdapter:
     def __init__(self, repo: str = "", token: str = ""):
         self.repo = repo or os.environ.get("GITHUB_REPO", "")
         self.token = token or os.environ.get("GITHUB_TOKEN", "")
-        if not self.token:
+        if not self.token or self.token in ("paste-your-token-here", "ghp_..."):
             raise EnvironmentError(
-                "GITHUB_TOKEN not set. Add it to .env or export it."
+                "GITHUB_TOKEN not set. Add a real token to .env:\n"
+                "  1. Go to github.com/settings/tokens\n"
+                "  2. Generate new token (classic) → check 'repo' scope\n"
+                "  3. Paste the ghp_... token as GITHUB_TOKEN in .env"
             )
         if not self.repo:
             raise EnvironmentError(
                 "GITHUB_REPO not set. Add it to .env (format: org/repo-name)."
             )
+
+    def verify_token(self) -> None:
+        """Verify the token is valid before starting a pipeline run."""
+        try:
+            self._get("/user")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                raise EnvironmentError(
+                    "GITHUB_TOKEN is invalid or expired (got 401).\n\n"
+                    "  Fix: go to github.com/settings/tokens → generate a new\n"
+                    "  classic token with 'repo' scope → update GITHUB_TOKEN in .env"
+                ) from None
+            raise
 
     # ── HTTP helpers ──────────────────────────────────────────────────────────
 

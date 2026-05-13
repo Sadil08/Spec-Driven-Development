@@ -74,12 +74,19 @@ def run_command(
         console.print(f"  [red]✗[/red]  {e}\n")
         raise typer.Exit(1)
 
-    # ── check ANTHROPIC_API_KEY ───────────────────────────────────────────────
-    if not os.environ.get("ANTHROPIC_API_KEY"):
+    # ── check at least one LLM backend is configured ─────────────────────────
+    has_gemini_vertex = os.environ.get("GEMINI_VERTEX", "").lower() in ("true", "1", "yes")
+    has_gemini_key = bool(os.environ.get("GEMINI_API_KEY", ""))
+    has_anthropic = bool(os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID", "")) or (
+        os.environ.get("ANTHROPIC_API_KEY", "") not in ("", "paste-your-key-here", "sk-ant-...")
+    )
+    if not (has_gemini_vertex or has_gemini_key or has_anthropic):
         console.print(
-            "  [red]✗[/red]  [bold]ANTHROPIC_API_KEY[/bold] not set.\n\n"
-            "  Add it to [cyan].env[/cyan]:\n"
-            "    [dim]ANTHROPIC_API_KEY=sk-ant-...[/dim]\n"
+            "  [red]✗[/red]  No LLM backend configured.\n\n"
+            "  Add one of these to [cyan].env[/cyan]:\n"
+            "    [dim]GEMINI_VERTEX=true  (free, uses GOOGLE_APPLICATION_CREDENTIALS)[/dim]\n"
+            "    [dim]GEMINI_API_KEY=AIza...  (free tier via Google AI Studio)[/dim]\n"
+            "    [dim]ANTHROPIC_API_KEY=sk-ant-...  (paid)[/dim]\n"
         )
         raise typer.Exit(1)
 
@@ -99,8 +106,13 @@ def run_command(
             try:
                 from speckit.adapters.github import GitHubAdapter
                 github = GitHubAdapter(repo=repo, token=token)
+                github.verify_token()
+                console.print(f"  [green]✓[/green]  GitHub connected  [dim]{repo}[/dim]")
+            except EnvironmentError as e:
+                console.print(f"\n  [red]✗[/red]  {e}\n")
+                raise typer.Exit(1)
             except Exception as e:
-                console.print(f"  [yellow]⚠[/yellow]  GitHub setup failed: {e}. Using manual entry.\n")
+                console.print(f"  [yellow]⚠[/yellow]  GitHub check failed: {e}\n  Switching to manual entry.\n")
                 no_github = True
 
     # ── auto-index if missing ─────────────────────────────────────────────────
@@ -148,7 +160,16 @@ def run_command(
     try:
         result = pipeline.run(issue_number=issue, issue=issue_obj)
     except Exception as e:
-        console.print(f"\n  [red]✗[/red]  Pipeline failed: {e}")
+        err = str(e)
+        if "401" in err:
+            console.print(
+                "\n  [red]✗[/red]  GitHub returned 401 Unauthorized.\n\n"
+                "  Your GITHUB_TOKEN is invalid or expired.\n"
+                "  Fix: github.com/settings/tokens → new classic token → repo scope\n"
+                "  Then update GITHUB_TOKEN in [cyan].env[/cyan]\n"
+            )
+        else:
+            console.print(f"\n  [red]✗[/red]  Pipeline failed: {e}")
         run_dir = project_root / config.paths.runs.lstrip("./") / f"bug-fix-{issue}"
         if run_dir.exists():
             console.print(

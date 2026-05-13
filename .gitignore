@@ -11,6 +11,7 @@ build/
 # speckit secrets — NEVER commit these
 .env
 .speckit/.env
+*.json  # service account keys — private keys inside
 
 # speckit run logs (optional — remove if you want to commit run artifacts)
 runs/*/00_run_log.md

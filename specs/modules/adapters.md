@@ -1,64 +1,42 @@
 ---
 module: adapters
-affects: [pipeline, commands]
-files: [speckit/adapters/vector_db.py, speckit/adapters/local_index.py, speckit/adapters/supabase_index.py, speckit/adapters/github.py, speckit/adapters/shell.py]
-last_updated: 2026-05-09
+affects: []
+files: ['speckit/adapters/__init__.py', 'speckit/adapters/github.py', 'speckit/adapters/local_index.py', 'speckit/adapters/shell.py', 'speckit/adapters/supabase_index.py', 'speckit/adapters/vector_db.py']
 ---
 
-# Module: adapters
+# Adapters Module
 
 ## Purpose
-External integrations behind stable interfaces. The pipeline code never imports
-adapter implementations directly — it calls through vector_db.py (factory) and
-the GitHubAdapter class.
+This module provides interfaces to external services and local resources that Speckit interacts with. It abstracts away the complexities of specific APIs and storage mechanisms, allowing Speckit's core logic to remain independent of implementation details. Adapters include interfaces for GitHub, local file indexing, shell commands, and vector databases.
 
-## Public interface
-| Name | File | Description |
-|------|------|-------------|
-| get_adapter(config, project_root) | vector_db.py | Returns best available index adapter |
-| search_specs(query, config, project_root, top_k) | vector_db.py | One-call spec search |
-| LocalIndex | local_index.py | BM25 index stored at .speckit/index.json |
-| SupabaseIndex | supabase_index.py | pgvector index via Supabase + OpenAI embeddings |
-| GitHubAdapter | github.py | GitHub REST v3: issues, branches, file contents, PRs |
-| ShellAdapter | shell.py | Safe subprocess runner with executable allowlist |
+## Public interfaces
+*   `GitHubAdapter`: A class to interact with the GitHub REST API v3 for issues, branches, file contents, and pull requests.
+*   `LocalIndex`: A class to manage a local JSON-based BM25 spec index.
+*   `ShellAdapter`: A class to execute shell commands safely within the project directory.
+*   `SupabaseIndex`: A class to interact with a Supabase instance using pgvector for spec indexing.
+*   `get_adapter`: A factory function that returns the appropriate index adapter (Supabase or LocalIndex) based on configuration and environment variables.
 
-## Adapter selection (vector_db.py)
-1. If sdd.config.yml sets `vector_db.provider: supabase` AND
-   SPECKIT_VECTOR_DB_URL + SPECKIT_VECTOR_DB_KEY + OPENAI_API_KEY are all set → SupabaseIndex
-2. Otherwise → LocalIndex (always available, zero external deps)
-A Rich warning is printed when Supabase is configured but env vars are missing.
+## Data flow
+Data enters the adapters module from Speckit's core components (e.g., `SpecFile` objects) or from external services (e.g., GitHub API responses). For indexing adapters (`LocalIndex`, `SupabaseIndex`), data flows into the adapter for storage and retrieval. For the `GitHubAdapter`, data flows out as API requests and in as API responses. The `ShellAdapter` takes commands as input and returns their execution results. The `get_adapter` function acts as a gateway, directing data flow to the chosen underlying index adapter.
 
-## LocalIndex (BM25)
-- Index stored at: `.speckit/index.json`
-- Build: `adapter.build(spec_files)` — tokenise, compute TF, compute IDF, persist JSON
-- Search: BM25 scoring (k1=1.5, b=0.75) against tokenised query
-- Frontmatter fields weighted higher than body (module×5, title×3, affects×3, body×1)
-- `is_built()` returns True if index.json exists
-
-## SupabaseIndex
-- Requires: `pip install 'speckit[supabase]'` (adds supabase + openai packages)
-- Embedding model: text-embedding-3-small (1536 dims)
-- Table: speckit_files with pgvector column
-- Setup SQL: `speckit index --setup-sql`
-- Upsert on (project, path) — re-indexing is idempotent
-
-## GitHubAdapter
-- Auth: Bearer token from GITHUB_TOKEN env var
-- Repo: GITHUB_REPO env var (format: org/repo-name)
-- Key methods: get_issue, add_comment, create_branch, get_file_contents, list_files, create_pr
-- All HTTP via httpx with 20s timeout
-
-## ShellAdapter
-- Allowed executables: pytest, python, python3, npm, npx, yarn, pnpm, go, cargo,
-  make, jest, vitest, mocha
-- Any other executable raises ValueError — no arbitrary command execution
-- Default timeout: 300s (5 min)
+## Architecture principles
+*   **Abstraction**: Each adapter provides a consistent interface for its functionality, hiding the underlying implementation details.
+*   **Configuration-driven**: The choice of index adapter is determined by `SpeckitConfig` and environment variables.
+*   **Error Handling**: Adapters are expected to handle potential errors from external services or local operations (e.g., missing environment variables, API errors, command execution failures).
+*   **Dependency Management**: Adapters should minimize direct dependencies on other Speckit modules, relying on clear interfaces.
 
 ## Dependencies
-- Depends on: core/config (SpeckitConfig, VectorDBProvider)
-- Depended on by: commands/index, modes/bug_fix
+- Internal:
+    - `speckit.core.config`
+    - `speckit.core.spec_parser` (type hinting)
+- External:
+    - `httpx` (for `GitHubAdapter`)
+    - `json`, `math`, `re`, `collections`, `datetime`, `pathlib` (standard library)
+    - `subprocess` (standard library)
 
-## Security notes
-- GitHub token never logged
-- ShellAdapter allowlist prevents command injection via untrusted spec content
-- SupabaseIndex keys loaded from env vars only, never from config file
+## Known gaps / TODOs
+*   The `GitHubAdapter` is not fully implemented; it raises an `EnvironmentError` in its `__init__` and lacks methods for actual API interaction.
+*   The `LocalIndex`'s `_build_term_frequencies` method is incomplete, indicated by `_tokeni`.
+*   The `ShellAdapter`'s `__init__` method is incomplete, indicated by `Ru`.
+*   The `SupabaseIndex`'s `SUPABASE_SETUP_SQL` string is incomplete, indicated by `create o`.
+*   The `vector_db.py` module's `get_adapter` function has an incomplete import for `SupabaseIndex` and an incomplete assignment for `adapter`.
