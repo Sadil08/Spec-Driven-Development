@@ -203,18 +203,43 @@ def _print_result(result, project_root: Path, config) -> None:
         else f"[yellow]needs human review[/yellow] (score {score_str} < {config.agent.judge_threshold})"
     )
 
-    console.print(Panel.fit(
-        f"  Judge: {approval}\n"
-        f"  Iterations: {result.judge_iterations}\n"
-        f"  Artifacts:  [cyan]{rel_dir}/[/cyan]\n"
-        + (
-            f"\n  [yellow]Next:[/yellow] Review [cyan]{rel_dir}/02_bug_report.md[/cyan] "
-            "before implementing the fix."
-            if result.approved
-            else f"\n  [yellow]Action:[/yellow] Open [cyan]{rel_dir}/02_bug_report.md[/cyan] "
+    tests_line = ""
+    if result.tests_passed:
+        tests_line = "\n  Tests:      [green]passed[/green]"
+    elif "05_test_results.md" in result.artifacts:
+        tests_line = "\n  Tests:      [red]failed[/red] — see 05_test_results.md"
+
+    pr_line = ""
+    if result.pr_url:
+        pr_line = f"\n  PR:         [cyan]{result.pr_url}[/cyan]"
+    elif result.branch:
+        pr_line = f"\n  Branch:     [cyan]{result.branch}[/cyan] (push when ready)"
+
+    if result.pr_url:
+        next_line = "\n  [green]Done![/green] Review the PR before merging."
+    elif result.approved and result.tests_passed:
+        next_line = f"\n  [yellow]Next:[/yellow] Push branch [cyan]{result.branch}[/cyan] and open a PR."
+    elif result.approved:
+        next_line = (
+            f"\n  [yellow]Next:[/yellow] Fix failing tests in "
+            f"[cyan]{rel_dir}/04_code_changes.md[/cyan] then push."
+        )
+    else:
+        next_line = (
+            f"\n  [yellow]Action:[/yellow] Open [cyan]{rel_dir}/02_bug_report.md[/cyan] "
             "and address the judge's gaps before proceeding."
-        ),
-        border_style="green" if result.approved else "yellow",
+        )
+
+    border = "green" if result.pr_url else ("bright_blue" if result.approved else "yellow")
+
+    console.print(Panel.fit(
+        f"  Judge:      {approval}\n"
+        f"  Iterations: {result.judge_iterations}"
+        + tests_line
+        + pr_line
+        + f"\n  Artifacts:  [cyan]{rel_dir}/[/cyan]"
+        + next_line,
+        border_style=border,
         padding=(0, 2),
     ))
     console.print()

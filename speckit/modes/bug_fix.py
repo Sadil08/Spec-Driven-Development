@@ -2,17 +2,18 @@
 Mode B — Bug fix pipeline.
 
 Stages:
-  1. Fetch issue from GitHub (or accept a pre-built Issue object)
-  2. Classify → 01_classification.md
-  3. Search specs (BM25 or Supabase) for relevant files
-  4. Read source files referenced in spec frontmatter
-  5. Draft bug report → 02_bug_report.md (draft)
-  6. Judge loop → refine until approved or max iterations
-  7. Write final 02_bug_report.md (approved / human-review-needed)
-  8. Write test plan → 03_test_plan.md
-  [future] 9. Write code fix → 04_code_changes.md
-  [future] 10. Run tests → 05_test_results.md
-  [future] 11. Create PR
+  1.  Fetch issue from GitHub (or accept a pre-built Issue object)
+  2.  Classify → 01_classification.md
+  3.  Search specs (BM25 or Supabase) for relevant files
+  4.  Read source files referenced in spec frontmatter
+  5.  Draft bug report → 02_bug_report.md (draft)
+  6.  Judge loop → refine until approved or max iterations
+  7.  Write final 02_bug_report.md (approved / human-review-needed)
+  8.  Write test plan → 03_test_plan.md
+  9.  Write code fix → 04_code_changes.md  (skipped if judge not approved)
+  10. Run tests → 05_test_results.md
+  11. Retry code fix up to 2× if tests fail
+  12. Commit + push branch + open PR  (skipped if --no-github)
 """
 from __future__ import annotations
 
@@ -34,6 +35,9 @@ class RunResult:
     judge_score: float
     judge_iterations: int
     artifacts: list[str] = field(default_factory=list)
+    pr_url: str = ""
+    branch: str = ""
+    tests_passed: bool = False
     error: str = ""
 
 
@@ -82,6 +86,44 @@ class BugFixPipeline:
     def _read_spec_file(self, name: str) -> str:
         p = self.project_root / self.config.paths.specs.lstrip("./") / name
         return p.read_text(encoding="utf-8") if p.exists() else ""
+
+    def _slug(self, title: str) -> str:
+        import re
+        return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40]
+
+    def _git(self, *args: str) -> tuple[int, str]:
+        import subprocess
+        r = subprocess.run(
+            ["git", *args],
+            cwd=self.project_root,
+            capture_output=True,
+            text=True,
+        )
+        return r.returncode, (r.stdout + r.stderr).strip()
+
+    def _apply_code_changes(self, code_plan) -> list[str]:
+        """Write code changes to disk. Returns list of changed file paths."""
+        changed: list[str] = []
+        for change in code_plan.changes:
+            if not change.file or not change.content:
+                continue
+            target = self.project_root / change.file
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(change.content, encoding="utf-8")
+            changed.append(change.file)
+        return changed
+
+    def _build_code_changes_md(self, code_plan, test_result=None) -> str:
+        lines = [f"# Code changes\n\n**Summary:** {code_plan.summary}\n"]
+        for c in code_plan.changes:
+            lines.append(f"\n## `{c.file}` ({c.action})\n")
+            lines.append(f"**Why:** {c.explanation}\n")
+            ext = c.file.rsplit(".", 1)[-1] if "." in c.file else ""
+            lines.append(f"```{ext}\n{c.content}\n```")
+        if test_result:
+            status = "PASSED" if test_result.passed else "FAILED"
+            lines.append(f"\n## Test results — {status}\n```\n{test_result.summary()}\n```")
+        return "\n".join(lines)
 
     # ── pipeline steps ────────────────────────────────────────────────────────
 
@@ -291,10 +333,125 @@ class BugFixPipeline:
             self._write("03_test_plan.md", test_plan)
             result.artifacts.append("03_test_plan.md")
 
-            self._step(
-                "Pipeline complete",
-                "code phase not yet implemented — review artifacts and proceed manually",
-            )
+            # ── 9-11. Code fix + tests + PR (only if judge approved) ─────────
+            if not judge_result.approved:
+                self._step(
+                    "Skipping code phase",
+                    "bug report needs human review before code is written",
+                )
+            else:
+                from speckit.core.agents import write_code, CodePlan
+                from speckit.adapters.shell import ShellAdapter
+
+                test_runner = self.config.testing.backend_runner or "pytest"
+                branch_name = f"fix/issue-{issue_number}-{self._slug(issue.title)}"
+
+                # Create git branch
+                rc, _ = self._git("checkout", "-b", branch_name)
+                if rc != 0:
+                    # Branch may already exist
+                    self._git("checkout", branch_name)
+                result.branch = branch_name
+                self._step("Branch created", branch_name)
+
+                # Retry loop: write code → run tests (up to 3 attempts)
+                shell = ShellAdapter(cwd=self.project_root)
+                code_plan: Optional[CodePlan] = None
+                test_result = None
+                prev_output = ""
+
+                for attempt in range(1, 4):
+                    self._step(
+                        f"Writing code fix (attempt {attempt})",
+                        f"{len(source_files)} source file(s)",
+                    )
+                    code_plan = write_code(
+                        bug_report_md=judge_result.final_spec,
+                        source_file_contents=source_files,
+                        test_runner=test_runner,
+                        config=self.config,
+                        project_root=self.project_root,
+                        previous_test_output=prev_output,
+                    )
+                    changed_files = self._apply_code_changes(code_plan)
+                    self._step(
+                        "Code applied",
+                        f"{len(changed_files)} file(s): {', '.join(changed_files[:3])}",
+                    )
+
+                    # Run tests
+                    self._step("Running tests", code_plan.test_command)
+                    try:
+                        test_result = shell.run_tests(code_plan.test_command)
+                    except ValueError as e:
+                        self._step("Test runner skipped", str(e))
+                        test_result = None
+                        break
+
+                    status = "passed" if test_result.passed else "failed"
+                    self._step(f"Tests {status}", f"exit code {test_result.return_code}")
+
+                    if test_result.passed:
+                        break
+                    prev_output = test_result.summary()
+
+                # Write code changes + test results artifacts
+                if code_plan:
+                    self._write(
+                        "04_code_changes.md",
+                        self._build_code_changes_md(code_plan, test_result),
+                    )
+                    result.artifacts.append("04_code_changes.md")
+
+                if test_result:
+                    result.tests_passed = test_result.passed
+                    self._write(
+                        "05_test_results.md",
+                        f"# Test results\n\n```\n{test_result.summary()}\n```",
+                    )
+                    result.artifacts.append("05_test_results.md")
+
+                # Commit + PR (only if tests passed and GitHub connected)
+                if test_result and test_result.passed and self.github and changed_files:
+                    self._step("Committing changes")
+                    self._git("add", *changed_files)
+                    self._git(
+                        "commit", "-m",
+                        f"fix(#{issue_number}): {code_plan.summary}\n\n"
+                        f"Closes #{issue_number}",
+                    )
+                    self._git("push", "-u", "origin", branch_name)
+
+                    pr_body = (
+                        f"## Summary\n\nFixes #{issue_number}: {issue.title}\n\n"
+                        f"{code_plan.summary}\n\n"
+                        f"## Changes\n"
+                        + "\n".join(f"- `{c.file}`: {c.explanation}" for c in code_plan.changes)
+                        + f"\n\n## Test results\nAll tests passed.\n\n"
+                        f"---\n*Generated by speckit — review before merging.*"
+                    )
+                    pr = self.github.create_pr(
+                        title=f"fix(#{issue_number}): {issue.title}",
+                        body=pr_body,
+                        head=branch_name,
+                        base=self.config.github.default_branch,
+                    )
+                    result.pr_url = pr.get("html_url", "")
+                    self._step("PR opened", result.pr_url)
+
+                elif changed_files:
+                    # No GitHub — just commit locally
+                    self._git("add", *changed_files)
+                    self._git(
+                        "commit", "-m",
+                        f"fix(#{issue_number}): {code_plan.summary}",
+                    )
+                    self._step(
+                        "Committed locally",
+                        "push manually when ready",
+                    )
+
+            self._step("Pipeline complete")
 
         except Exception as e:
             self._step("PIPELINE FAILED", str(e))

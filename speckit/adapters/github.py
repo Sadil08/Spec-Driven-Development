@@ -159,15 +159,14 @@ class GitHubAdapter:
 
     def create_pr(
         self,
-        branch: str,
         title: str,
         body: str,
+        head: str,
         base: str = "",
-    ) -> str:
-        """Create a pull request and return its HTML URL."""
+    ) -> dict:
+        """Create a pull request and return the full response dict."""
         base = base or self._default_branch()
-        data = self._post(
+        return self._post(
             f"/repos/{self.repo}/pulls",
-            {"title": title, "head": branch, "base": base, "body": body},
+            {"title": title, "head": head, "base": base, "body": body},
         )
-        return data["html_url"]

@@ -35,6 +35,19 @@ class JudgeScore(BaseModel):
     feedback: str
 
 
+class CodeChange(BaseModel):
+    file: str          # project-relative path
+    action: str        # "modify" | "create"
+    content: str       # full new file content
+    explanation: str   # why this fixes the bug
+
+
+class CodePlan(BaseModel):
+    changes: list[CodeChange]
+    test_command: str  # e.g. "pytest tests/" or "npm test"
+    summary: str       # one-line summary of all changes
+
+
 # ── backend abstraction ───────────────────────────────────────────────────────
 
 class _AnthropicBackend:
@@ -179,32 +192,59 @@ def _strip_fences(text: str) -> str:
 def _parse_json_safe(text: str) -> dict:
     """Parse JSON from LLM output, tolerating common formatting issues."""
     import re
+
+    def _try_loads(s: str):
+        try:
+            return json.loads(s), True
+        except Exception:
+            return None, False
+
     cleaned = _strip_fences(text)
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        pass
-    # Replace literal newlines inside strings with \\n
-    # Find all string values and escape newlines within them
+
+    # Attempt 1: direct parse
+    val, ok = _try_loads(cleaned)
+    if ok:
+        return val
+
+    # Attempt 2: escape bare newlines inside string values
     fixed = re.sub(
         r'"((?:[^"\\]|\\.)*)"',
         lambda m: '"' + m.group(1).replace('\n', '\\n').replace('\r', '') + '"',
         cleaned,
     )
-    try:
-        return json.loads(fixed)
-    except json.JSONDecodeError:
-        pass
-    # Last resort: extract key fields individually
+    val, ok = _try_loads(fixed)
+    if ok:
+        return val
+
+    # Attempt 3: field-by-field extraction
     result: dict = {}
     for key in ("score", "approved", "gaps", "feedback",
-                "issue_type", "severity", "affected_modules", "search_keywords", "summary"):
-        m = re.search(rf'"{key}"\s*:\s*("(?:[^"\\]|\\.)*"|\[.*?\]|true|false|[\d.]+)', cleaned, re.DOTALL)
-        if m:
-            try:
-                result[key] = json.loads(m.group(1))
-            except Exception:
-                result[key] = m.group(1).strip('"')
+                "issue_type", "severity", "affected_modules", "search_keywords", "summary",
+                "changes", "test_command", "summary"):
+        # Match the value after "key": — handles strings, arrays, booleans, numbers
+        m = re.search(
+            rf'"{key}"\s*:\s*(\[.*?\]|\{{.*?\}}|"(?:[^"\\]|\\.)*"|true|false|[\d.]+)',
+            cleaned, re.DOTALL,
+        )
+        if not m:
+            continue
+        raw_val = m.group(1)
+        val, ok = _try_loads(raw_val)
+        if ok:
+            result[key] = val
+        else:
+            # If it looks like an array/object but failed, try cleaning it
+            if raw_val.startswith('[') or raw_val.startswith('{'):
+                escaped = re.sub(
+                    r'"((?:[^"\\]|\\.)*)"',
+                    lambda mv: '"' + mv.group(1).replace('\n', '\\n') + '"',
+                    raw_val,
+                )
+                val, ok = _try_loads(escaped)
+                result[key] = val if ok else raw_val
+            else:
+                result[key] = raw_val.strip('"')
+
     if result:
         return result
     raise ValueError(f"Could not parse JSON from LLM response: {text[:200]}")
@@ -644,3 +684,89 @@ Write specs/architecture.md:
 """
 
     return backend.call(system, user, max_tokens=2000)
+
+
+# ── agent 8: write code fix ───────────────────────────────────────────────────
+
+def write_code(
+    bug_report_md: str,
+    source_file_contents: dict[str, str],
+    test_runner: str,
+    config: "SpeckitConfig",
+    project_root: Path,
+    previous_test_output: str = "",
+) -> CodePlan:
+    """~4 000 input / ~3 000 output tokens."""
+    backend = _get_backend(config)
+
+    system = _prompt_override("write_code", project_root) or """
+You are a senior software engineer implementing a bug fix.
+RULES:
+- Make the MINIMAL change that fixes the root cause described in the bug report.
+- Output FULL file contents for every modified file — not diffs or snippets.
+- Never introduce new dependencies unless the bug report explicitly requires them.
+- Never remove existing functionality unrelated to the fix.
+- Return JSON only — no markdown, no explanation outside the JSON.
+"""
+
+    source_text = "\n\n".join(
+        f"### {path}\n```\n{content}\n```"
+        for path, content in list(source_file_contents.items())[:6]
+    ) or "(no source files available — infer from bug report)"
+
+    retry_section = ""
+    if previous_test_output:
+        retry_section = f"""
+## Previous attempt failed
+The tests failed with this output. Fix the remaining issues:
+```
+{previous_test_output[:1500]}
+```
+"""
+
+    user = f"""## Approved bug report
+{bug_report_md[:3000]}
+
+## Current source files
+{source_text}
+{retry_section}
+---
+Return JSON with this exact structure:
+{{
+  "changes": [
+    {{
+      "file": "relative/path/to/file.py",
+      "action": "modify",
+      "content": "FULL new file content here",
+      "explanation": "one sentence: what changed and why"
+    }}
+  ],
+  "test_command": "{test_runner}",
+  "summary": "one-line summary of all changes"
+}}
+
+Rules for the JSON:
+- "file" must be a project-relative path (e.g. "src/auth/middleware.py")
+- "action" is "modify" for existing files, "create" for new files
+- "content" is the COMPLETE file — not a diff, not a snippet
+- Include ALL changed files in the array
+"""
+
+    raw = backend.call(system, user, max_tokens=4000)
+    data = _parse_json_safe(raw)
+
+    # Normalise: content strings sometimes come back escaped
+    changes = []
+    for c in data.get("changes", []):
+        changes.append(CodeChange(
+            file=c.get("file", ""),
+            action=c.get("action", "modify"),
+            content=c.get("content", ""),
+            explanation=c.get("explanation", ""),
+        ))
+
+    return CodePlan(
+        changes=changes,
+        test_command=data.get("test_command", test_runner),
+        summary=data.get("summary", "Code fix applied"),
+    )
