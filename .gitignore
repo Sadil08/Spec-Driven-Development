@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# speckit secrets — NEVER commit these
+.env
+.speckit/.env
+*.json  # service account keys — private keys inside
+
+# speckit run logs (optional — remove if you want to commit run artifacts)
+runs/*/00_run_log.md
+
+# local index
+.speckit/index.json
+
+# OS
+.DS_Store
