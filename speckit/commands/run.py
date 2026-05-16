@@ -44,6 +44,17 @@ def run_command(
         "--no-github",
         help="Skip GitHub — enter issue details manually. Useful for local testing.",
     ),
+    model: str = typer.Option(
+        "",
+        "--model",
+        "-m",
+        help="Override LLM model for this run (e.g. claude-sonnet-4-6, gemini-2.5-flash).",
+    ),
+    coding_backend: str = typer.Option(
+        "",
+        "--coding-backend",
+        help="Backend for code writing: auto | anthropic | gemini | vertex.",
+    ),
 ):
     """
     Run the full spec-driven bug-fix pipeline for a GitHub issue.
@@ -73,6 +84,12 @@ def run_command(
     except FileNotFoundError as e:
         console.print(f"  [red]✗[/red]  {e}\n")
         raise typer.Exit(1)
+
+    # Apply CLI overrides to config
+    if model:
+        config.agent.model = model
+    if coding_backend:
+        config.agent.coding_backend = coding_backend
 
     # ── check at least one LLM backend is configured ─────────────────────────
     has_gemini_vertex = os.environ.get("GEMINI_VERTEX", "").lower() in ("true", "1", "yes")
@@ -232,11 +249,22 @@ def _print_result(result, project_root: Path, config) -> None:
 
     border = "green" if result.pr_url else ("bright_blue" if result.approved else "yellow")
 
+    # Token usage line
+    from speckit.core.agents import get_cost_summary_md as _cost_md
+    cost_text = _cost_md()
+    total_tokens = ""
+    if cost_text:
+        import re as _re
+        m = _re.search(r"\*\*(\d[\d,]+)\*\*\s*\|\s*\*\*(\d[\d,]+)\*\*", cost_text)
+        if m:
+            total_tokens = f"\n  Tokens:     [dim]{m.group(1)} in / {m.group(2)} out[/dim]"
+
     console.print(Panel.fit(
         f"  Judge:      {approval}\n"
         f"  Iterations: {result.judge_iterations}"
         + tests_line
         + pr_line
+        + total_tokens
         + f"\n  Artifacts:  [cyan]{rel_dir}/[/cyan]"
         + next_line,
         border_style=border,

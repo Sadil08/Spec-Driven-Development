@@ -116,6 +116,7 @@ def scan_command(
     path: str = typer.Argument(default=".", help="Project root."),
     out: str = typer.Option("./specs", "--out", "-o", help="Output directory for spec files."),
     force: bool = typer.Option(False, "--force", "-f", help="Overwrite existing spec files."),
+    skip_judge: bool = typer.Option(False, "--skip-judge", help="Skip quality judge after generating specs."),
 ):
     """
     Generate spec files from an existing codebase (brownfield mode).
@@ -267,15 +268,99 @@ def scan_command(
                 progress.remove_task(task)
                 console.print(f"  [red]✗[/red]  architecture.md  [red]{e}[/red]")
 
+    # ── quality judge ─────────────────────────────────────────────────────────
+    if not skip_judge and generated:
+        console.print()
+        console.print("  [dim]Running quality judge on generated specs…[/dim]\n")
+        _run_scan_judge(generated, out_path, project_root, config)
+
     # ── done ──────────────────────────────────────────────────────────────────
     console.print()
     console.print(Panel.fit(
         f"  [bold green]Scan complete[/bold green] — {len(generated)} spec file(s) written\n\n"
         "  [yellow]Next:[/yellow]\n"
-        "  1. [dim]Review generated specs in[/dim] [cyan]specs/[/cyan] [dim]— edit anything that looks wrong[/dim]\n"
+        "  1. [dim]Review generated specs in[/dim] [cyan]specs/[/cyan] [dim]— fix any flagged issues[/dim]\n"
         "  2. Run [bold]speckit index[/bold] [dim]— build the search index[/dim]\n"
         "  3. Run [bold]speckit run --issue N[/bold] [dim]— fix a real issue[/dim]",
         border_style="green",
         padding=(0, 2),
     ))
     console.print()
+
+
+def _run_scan_judge(
+    generated: list[str],
+    out_path: Path,
+    project_root: Path,
+    config,
+) -> None:
+    from speckit.core.agents import judge_scan_spec
+
+    _SEVERITY_COLOR = {"error": "red", "warning": "yellow", "info": "dim"}
+    _SEVERITY_ICON = {"error": "✗", "warning": "⚠", "info": "·"}
+
+    any_issues = False
+    report_lines: list[str] = ["# Scan quality report\n"]
+
+    for rel_path in generated:
+        abs_path = project_root / rel_path
+        if not abs_path.exists():
+            continue
+
+        name = abs_path.name
+        # Determine spec type from path
+        if name == "architecture.md":
+            spec_type = "architecture"
+        elif abs_path.parent.name == "modules":
+            spec_type = "module"
+        elif name == "security.md":
+            spec_type = "security"
+        elif name == "coding-standards.md":
+            spec_type = "coding-standards"
+        else:
+            continue  # skip unknown types
+
+        try:
+            content = abs_path.read_text(encoding="utf-8")
+            result = judge_scan_spec(name, spec_type, content, config, project_root)
+        except Exception as e:
+            console.print(f"  [dim]Judge failed for {name}: {e}[/dim]")
+            continue
+
+        verdict_color = {"good": "green", "needs-review": "yellow", "poor": "red"}.get(result.verdict, "dim")
+        console.print(
+            f"  [{verdict_color}]{'●' if result.issues else '✓'}[/{verdict_color}]  "
+            f"[cyan]{rel_path}[/cyan]  "
+            f"[{verdict_color}]{result.verdict}[/{verdict_color}]  "
+            f"[dim](score {result.score:.2f})[/dim]"
+        )
+
+        report_lines.append(f"\n## {rel_path} — {result.verdict} (score {result.score:.2f})\n")
+
+        if result.issues:
+            any_issues = True
+            for issue in result.issues:
+                sev = issue.severity
+                color = _SEVERITY_COLOR.get(sev, "dim")
+                icon = _SEVERITY_ICON.get(sev, "·")
+                console.print(
+                    f"       [{color}]{icon}[/{color}]  [{color}]{issue.message}[/{color}]\n"
+                    f"          [dim]→ {issue.suggestion}[/dim]"
+                )
+                report_lines.append(f"- **{sev.upper()}**: {issue.message}\n  → {issue.suggestion}")
+        else:
+            report_lines.append("No issues found.")
+
+    # Write quality report
+    report_path = out_path / "scan_quality_report.md"
+    report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+
+    if any_issues:
+        console.print(
+            f"\n  [yellow]⚠[/yellow]  Quality issues found. "
+            f"Review [cyan]specs/scan_quality_report.md[/cyan] before indexing.\n"
+        )
+    else:
+        console.print(
+            f"\n  [green]✓[/green]  All specs passed quality review.\n"
+        )

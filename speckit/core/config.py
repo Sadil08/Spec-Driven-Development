@@ -37,6 +37,11 @@ class AgentConfig(BaseModel):
     judge_threshold: float = Field(default=0.85, ge=0.0, le=1.0)
     max_judge_iterations: int = Field(default=5, ge=1, le=10)
     max_spec_read_files: int = Field(default=5, ge=1, le=20)
+    # Optional separate backend just for code writing.
+    # "auto" = same as default backend; "anthropic" = force Anthropic API;
+    # "gemini" = force Gemini (Vertex or AI Studio); "vertex" = force Vertex AI.
+    coding_backend: str = "auto"
+    coding_model: str = ""   # overrides model for code-writing step only
 
 
 class VectorDBConfig(BaseModel):

@@ -14,6 +14,8 @@ agent:
   judge_threshold: 0.85
   max_judge_iterations: 5
   max_spec_read_files: 5
+  coding_backend: auto   # auto | anthropic | gemini | vertex
+  coding_model: ''       # override model for code-writing step only
 vector_db:
   provider: none
   index_name: speckit-specs

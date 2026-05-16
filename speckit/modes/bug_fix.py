@@ -125,6 +125,40 @@ class BugFixPipeline:
             lines.append(f"\n## Test results — {status}\n```\n{test_result.summary()}\n```")
         return "\n".join(lines)
 
+    def _sync_specs(self, classification, bug_report_md: str, code_plan) -> None:
+        """Update spec files touched by this fix to reflect what changed."""
+        from speckit.core.agents import sync_spec_file
+
+        changes_summary = (
+            f"Bug fix summary: {code_plan.summary}\n\n"
+            "Files changed:\n"
+            + "\n".join(f"- {c.file}: {c.explanation}" for c in code_plan.changes)
+        )
+
+        specs_root = self.project_root / self.config.paths.specs.lstrip("./") / "modules"
+        synced: list[str] = []
+
+        for module in classification.affected_modules:
+            spec_path = specs_root / f"{module}.md"
+            if not spec_path.exists():
+                continue
+            try:
+                current = spec_path.read_text(encoding="utf-8")
+                updated = sync_spec_file(
+                    spec_name=f"{module}.md",
+                    current_spec_content=current,
+                    changes_summary=changes_summary,
+                    config=self.config,
+                    project_root=self.project_root,
+                )
+                spec_path.write_text(updated, encoding="utf-8")
+                synced.append(module)
+            except Exception as e:
+                self._step(f"Spec sync skipped for {module}", str(e))
+
+        if synced:
+            self._step("Spec files updated", ", ".join(synced))
+
     # ── pipeline steps ────────────────────────────────────────────────────────
 
     def _fetch_issue(self, issue_number: int) -> "Issue":
@@ -211,8 +245,11 @@ class BugFixPipeline:
         If `issue` is provided, GitHub fetch is skipped — useful for
         --no-github mode where the user enters issue details manually.
         """
-        from speckit.core.agents import draft_bug_report, write_test_plan
+        from speckit.core.agents import draft_bug_report, write_test_plan, reset_cost_log, get_cost_summary_md
         from speckit.core.judge import run_judge_loop
+        from speckit.adapters.slack import SlackNotifier
+        reset_cost_log()
+        slack = SlackNotifier(self.config)
 
         # Setup run directory
         runs_path = self.config.paths.runs.lstrip("./")
@@ -323,6 +360,13 @@ class BugFixPipeline:
                 self._step(
                     "Judge threshold not met — human review required",
                     f"score={judge_result.final_score:.2f} < {self.config.agent.judge_threshold}",
+                )
+                slack.judge_failed(
+                    run_type="bug-fix",
+                    name=f"issue #{issue_number}",
+                    score=judge_result.final_score,
+                    threshold=self.config.agent.judge_threshold,
+                    gaps=[],
                 )
 
             # ── 8. Test plan ─────────────────────────────────────────────────
@@ -438,6 +482,12 @@ class BugFixPipeline:
                     )
                     result.pr_url = pr.get("html_url", "")
                     self._step("PR opened", result.pr_url)
+                    slack.pr_opened(
+                        issue_number=issue_number,
+                        title=issue.title,
+                        pr_url=result.pr_url,
+                        score=judge_result.final_score,
+                    )
 
                 elif changed_files:
                     # No GitHub — just commit locally
@@ -451,6 +501,15 @@ class BugFixPipeline:
                         "push manually when ready",
                     )
 
+            # ── 12. Spec sync ─────────────────────────────────────────────
+            if judge_result.approved and code_plan:
+                self._step("Syncing spec files")
+                self._sync_specs(classification, judge_result.final_spec, code_plan)
+
+            cost_md = get_cost_summary_md()
+            if cost_md:
+                self._log_lines.append(cost_md)
+                self._flush_log()
             self._step("Pipeline complete")
 
         except Exception as e:

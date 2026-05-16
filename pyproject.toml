@@ -23,6 +23,15 @@ supabase = [
     "supabase>=2.4",
     "openai>=1.30",
 ]
+# pip install 'speckit[server]'  — enables webhook server (speckit serve)
+server = [
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.30",
+]
+# pip install 'speckit[mcp]'  — enables Claude Pro MCP integration (speckit mcp)
+mcp = [
+    "mcp>=1.0",
+]
 # pip install 'speckit[dev]'  — development + testing tools
 dev = [
     "pytest>=8",
