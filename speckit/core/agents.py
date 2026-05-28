@@ -1090,8 +1090,12 @@ As a [user type], I want [capability], so that [outcome].
 ## Non-functional requirements
 | ID | Category | Requirement | Metric |
 |----|----------|-------------|--------|
-| NF01 | Performance | [requirement] | [measurable target] |
-| NF02 | Security | [requirement] | [standard] |
+| NF01 | Performance | [requirement] | [measurable target e.g. p95 < 200ms, throughput > 500 rps] |
+| NF02 | Security | [requirement] | [standard e.g. OWASP Top 10 compliant, TLS 1.2+] |
+| NF03 | Scalability | [requirement] | [measurable target e.g. supports 10k concurrent users, horizontal scale-out] |
+| NF04 | Reliability | [requirement] | [measurable target e.g. 99.9% uptime, RTO < 5 min, zero data loss] |
+| NF05 | Maintainability | [requirement] | [measurable target e.g. cyclomatic complexity < 10, test coverage > 80%] |
+| NF06 | Observability | [requirement] | [measurable target e.g. all errors logged with trace ID, p99 latency tracked] |
 
 ## Data model changes
 ### New entities (if any)
@@ -1154,13 +1158,14 @@ def judge_feature_spec(
 {feature_spec_md[:2500]}
 
 ---
-Score on five dimensions (0-1 each, equal weight):
+Score on six dimensions (0-1 each, equal weight):
 
 1. **Completeness** — All sections filled, no TODOs or "TBD" without justification
 2. **Testability** — Every FR starts with "System shall" or "User can" and is verifiable
 3. **Architecture alignment** — Feature fits the principles without conflicts
 4. **Security** — Auth, input validation, and attack surface are addressed
-5. **Measurability** — NFRs have concrete targets, not vague descriptions
+5. **Measurability** — Every NFR row has a concrete, numeric target (not vague words like "fast" or "reliable")
+6. **NFR coverage** — The NFR table contains rows for ALL of: Performance, Security, Scalability, Reliability, Maintainability, and Observability — missing any of these is an automatic gap
 
 Return JSON only:
 {{
@@ -1287,7 +1292,8 @@ def judge_scan_spec(
             "2. Tech stack table has real versions, not placeholders\n"
             "3. Core principles are specific, not generic platitudes\n"
             "4. Security baseline has concrete policies (not 'TBD')\n"
-            "5. Module map references real spec files"
+            "5. Module map references real spec files\n"
+            "6. Cross-cutting concerns address performance, scalability, reliability, and observability with measurable targets — not blank or 'TBD'"
         ),
         "module": (
             "1. Purpose is a single clear paragraph (not vague)\n"
