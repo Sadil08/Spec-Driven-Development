@@ -370,3 +370,127 @@ SPECKIT_VECTOR_DB_KEY=
 # Notifications (optional)
 SLACK_WEBHOOK_URL=
 """
+
+
+GLOBAL_CONFIG_YML = """\
+# global.sdd.config.yml — Multi-service orchestrator config
+# Place this file at the root of your monorepo (or workspace root).
+# Each service listed here must have its own sdd.config.yml.
+# Run: speckit orchestrate --name "Feature" --description "..."
+
+project_name: {project_name}
+created: {date}
+
+# Where to store system-level specs and inter-service contracts
+global_specs: ./global-specs
+contracts_dir: ./global-specs/contracts
+runs_dir: ./runs
+
+agent:
+  model: claude-sonnet-4-6
+  judge_threshold: 0.85
+  max_judge_iterations: 3
+
+# List every service. depends_on controls build order.
+# Path must point to the directory containing sdd.config.yml for that service.
+services:
+  - name: frontend
+    path: ./frontend
+    depends_on:
+      - backend-api
+
+  - name: backend-api
+    path: ./backend-api
+    depends_on:
+      - auth-service
+
+  - name: auth-service
+    path: ./auth-service
+    depends_on: []
+
+# Add more services as your architecture grows:
+# - name: payments-service
+#   path: ./payments-service
+#   depends_on:
+#     - auth-service
+"""
+
+
+SYSTEM_ARCHITECTURE_MD = """\
+---
+project: {project_name}
+last_updated: {date}
+---
+
+# System architecture: {project_name}
+
+## Overview
+[2-3 sentences: what the overall system does and why it exists]
+
+## Services
+| Service | Responsibility | Tech stack |
+|---------|---------------|-----------|
+[one row per service]
+
+## System-level principles
+1. [principle — e.g. "All inter-service communication via versioned REST or events"]
+2. [principle — e.g. "No direct database access across service boundaries"]
+3. [principle — e.g. "Every service owns its own data store"]
+4. [principle]
+5. [principle]
+
+## Cross-cutting concerns
+- Authentication: [shared auth mechanism across services]
+- Observability: [logging/tracing strategy across services]
+- Error propagation: [how errors flow across service boundaries]
+- Configuration: [shared vs per-service config approach]
+
+## Deployment topology
+[How services are deployed — containers, cloud provider, service mesh, etc.]
+
+## Data flow (top level)
+[How a request flows through the system from entry point to data store]
+"""
+
+
+CONTRACT_MD = """\
+---
+producer: {producer}
+consumer: {consumer}
+last_updated: {date}
+---
+
+# Contract: {producer} → {consumer}
+
+## Purpose
+[What this inter-service contract covers]
+
+## API endpoints exposed by {producer}
+
+### POST /api/[endpoint]
+- **Auth:** Bearer token required
+- **Request:**
+  ```json
+  {{}}
+  ```
+- **Response 200:**
+  ```json
+  {{}}
+  ```
+- **Error codes:** 400 (validation), 401 (auth), 422 (business rule), 500 (server)
+
+## Events (if applicable)
+| Event | Topic/Queue | Payload shape | When emitted |
+|-------|------------|--------------|-------------|
+
+## SLA
+- p95 latency: < [target]ms
+- Availability: [target]%
+- Rate limit: [requests/minute]
+
+## Breaking change policy
+[How breaking changes are communicated and versioned]
+
+## Known consumers
+- {consumer}
+"""

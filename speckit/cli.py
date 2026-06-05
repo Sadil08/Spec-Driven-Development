@@ -12,6 +12,8 @@ from speckit.commands.feature import feature_command
 from speckit.commands.index import index_command
 from speckit.commands.serve import serve_command
 from speckit.commands.mcp import mcp_command
+from speckit.commands.orchestrate import orchestrate_command
+from speckit.commands.orchestrate_bug import orchestrate_bug_command
 
 app = typer.Typer(
     name="speckit",
@@ -29,6 +31,8 @@ app.command("feature", help="Run the spec-driven feature pipeline.")(feature_com
 app.command("index", help="Embed spec files into the vector database.")(index_command)
 app.command("serve", help="Start the GitHub webhook server.")(serve_command)
 app.command("mcp", help="Start the MCP server for Claude Pro integration.")(mcp_command)
+app.command("orchestrate", help="Run a cross-service feature pipeline.")(orchestrate_command)
+app.command("orchestrate-bug", help="Run a cross-service bug-fix pipeline.")(orchestrate_bug_command)
 
 
 def main():
