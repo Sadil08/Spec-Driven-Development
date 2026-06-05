@@ -141,6 +141,26 @@ class SlackNotifier:
             }],
         )
 
+    def contract_conflict(self, feature_name: str, conflicts: list[str]) -> None:
+        if not self._should_send("feature_blocked"):
+            return
+        conflicts_text = "\n".join(f"• {c}" for c in conflicts[:5])
+        self._send(
+            f"[{self._project}] Contract conflict blocked: {feature_name}",
+            blocks=[{
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*[{self._project}]* 🚫 Cross-service contract conflict\n"
+                        f"*Feature blocked:* {feature_name}\n"
+                        f"*Conflicts:*\n{conflicts_text}\n"
+                        f"_Fix conflicts in 02_contract_compatibility.md before proceeding._"
+                    ),
+                },
+            }],
+        )
+
     def feature_blocked(self, feature_name: str, verdict: str, score: float) -> None:
         if not self._should_send("feature_blocked"):
             return

@@ -1785,3 +1785,471 @@ figma: pending
 """
 
     return backend.call(system, user, max_tokens=2800, _agent="generate_design_doc")
+
+
+# ── orchestrator output models ────────────────────────────────────────────────
+
+class ServiceImpact(BaseModel):
+    service_name: str
+    reason: str
+    scope: str          # "full" | "partial" | "none"
+    affected_contracts: list[str]
+
+
+class ServiceImpactResult(BaseModel):
+    impacts: list[ServiceImpact]
+
+
+class CrossServiceCompatResult(BaseModel):
+    verdict: str                    # "approved" | "needs-changes" | "blocked"
+    conflicts: list[str]
+    breaking_changes: list[str]
+    recommendations: list[str]
+
+
+class ServiceSubFeature(BaseModel):
+    service_name: str
+    sub_feature_name: str
+    sub_feature_description: str
+    contract_constraints: str       # what contracts this service must honour
+
+
+class ServiceDecomposition(BaseModel):
+    sub_features: list[ServiceSubFeature]
+
+
+class NewServiceSpec(BaseModel):
+    name: str
+    purpose: str
+    tech_stack_hint: str
+    depends_on: list[str]
+
+
+class TopologyPlan(BaseModel):
+    services_to_create: list[NewServiceSpec]
+    services_to_modify: list[str]
+    reasoning: str
+
+
+# ── agent 21: analyze service impact ─────────────────────────────────────────
+
+def analyze_service_impact(
+    feature_name: str,
+    feature_description: str,
+    services_summary: dict[str, str],
+    config: "SpeckitConfig",
+    project_root: Path,
+) -> ServiceImpactResult:
+    """~2 000 input / ~600 output tokens."""
+    backend = _get_backend(config)
+
+    system = _prompt_override("analyze_service_impact", project_root) or (
+        "You are a senior architect analysing which microservices a proposed feature will touch. "
+        "Be precise — only include services that genuinely need to change. Return JSON only."
+    )
+
+    services_text = "\n\n".join(
+        f"### {name}\n{summary[:800]}"
+        for name, summary in services_summary.items()
+    )
+
+    user = f"""## Feature request
+Name: {feature_name}
+Description: {feature_description}
+
+## Existing services
+{services_text}
+
+---
+For each service, determine whether it needs to change.
+Return JSON only:
+{{
+  "impacts": [
+    {{
+      "service_name": "name",
+      "reason": "why this service is affected",
+      "scope": "full",
+      "affected_contracts": ["contract-file-name.md"]
+    }}
+  ]
+}}
+
+scope must be one of: "full" (major work), "partial" (minor addition), "none" (no change needed).
+Only include services with scope "full" or "partial".
+affected_contracts lists contract spec files (e.g. "backend-api__payments.md") that this change touches.
+"""
+
+    raw = backend.call(system, user, max_tokens=1000, _agent="analyze_service_impact")
+    return ServiceImpactResult(**_parse_json_safe(raw))
+
+
+# ── agent 22: check contract compatibility ────────────────────────────────────
+
+def check_contract_compatibility(
+    feature_name: str,
+    impacted_services: list[ServiceImpact],
+    contract_specs: dict[str, str],
+    config: "SpeckitConfig",
+    project_root: Path,
+) -> CrossServiceCompatResult:
+    """~3 000 input / ~800 output tokens."""
+    backend = _get_backend(config)
+
+    system = _prompt_override("check_contract_compatibility", project_root) or (
+        "You are a senior architect checking whether a cross-service feature will break "
+        "existing inter-service contracts. Be rigorous. Return JSON only."
+    )
+
+    impacts_text = "\n".join(
+        f"- {i.service_name} ({i.scope}): {i.reason}"
+        for i in impacted_services
+    )
+
+    contracts_text = "\n\n".join(
+        f"### {name}\n{content[:1000]}"
+        for name, content in contract_specs.items()
+    ) or "(no contract specs found — contracts/ directory is empty)"
+
+    user = f"""## Feature: {feature_name}
+
+## Services that will change
+{impacts_text}
+
+## Current inter-service contracts
+{contracts_text}
+
+---
+Will this feature break any existing contracts between services?
+Return JSON only:
+{{
+  "verdict": "approved",
+  "conflicts": ["specific contract violation"],
+  "breaking_changes": ["what existing behaviour will break"],
+  "recommendations": ["what to do to avoid breakage"]
+}}
+
+verdict: "approved" if no conflicts, "needs-changes" if fixable, "blocked" if fundamental conflict.
+"""
+
+    raw = backend.call(system, user, max_tokens=1200, _agent="check_contract_compatibility")
+    return CrossServiceCompatResult(**_parse_json_safe(raw))
+
+
+# ── agent 23: decompose cross-service feature ─────────────────────────────────
+
+def decompose_cross_service_feature(
+    feature_name: str,
+    feature_description: str,
+    impacted_services: list[ServiceImpact],
+    contract_specs: dict[str, str],
+    config: "SpeckitConfig",
+    project_root: Path,
+) -> ServiceDecomposition:
+    """~3 000 input / ~1 500 output tokens."""
+    backend = _get_backend(config)
+
+    system = _prompt_override("decompose_cross_service_feature", project_root) or """
+You are a senior architect decomposing a cross-service feature into per-service sub-features.
+RULES:
+- Each sub-feature must be scoped ONLY to what that service needs to build.
+- sub_feature_description must be detailed enough to pass to a spec-writing agent as a standalone feature.
+- contract_constraints must explicitly name the API/event contracts that service must honour.
+- Do not invent work — only what the feature requires.
+- Return JSON only.
+"""
+
+    impacts_text = "\n".join(
+        f"- {i.service_name} ({i.scope}): {i.reason}"
+        for i in impacted_services
+    )
+
+    contracts_text = "\n\n".join(
+        f"### {name}\n{content[:600]}"
+        for name, content in contract_specs.items()
+    ) or "(no existing contracts)"
+
+    user = f"""## Cross-service feature
+Name: {feature_name}
+Description: {feature_description}
+
+## Services involved
+{impacts_text}
+
+## Existing contracts
+{contracts_text}
+
+---
+Break this feature into one sub-feature per affected service.
+Return JSON only:
+{{
+  "sub_features": [
+    {{
+      "service_name": "frontend",
+      "sub_feature_name": "Add payment UI",
+      "sub_feature_description": "Detailed description of exactly what this service must build...",
+      "contract_constraints": "Must call POST /api/payments with {{amount, currency, token}}. Expects {{success, transaction_id}} response."
+    }}
+  ]
+}}
+"""
+
+    raw = backend.call(system, user, max_tokens=2500, _agent="decompose_cross_service_feature")
+    return ServiceDecomposition(**_parse_json_safe(raw))
+
+
+# ── agent 24: write cross-service build plan ──────────────────────────────────
+
+def write_cross_service_build_plan(
+    feature_name: str,
+    service_build_plans: dict[str, str],
+    dependency_order: list[str],
+    config: "SpeckitConfig",
+    project_root: Path,
+) -> str:
+    """~4 000 input / ~2 000 output tokens."""
+    backend = _get_backend(config)
+
+    system = _prompt_override("cross_service_build_plan", project_root) or """
+You are a senior engineer writing a sequenced build plan across multiple services.
+RULES:
+- Services must be built in dependency order — foundational services first.
+- Include an integration phase between each service phase.
+- Every phase must end with a verification step (run tests, check contract).
+- Return only the markdown document.
+"""
+
+    plans_text = "\n\n---\n\n".join(
+        f"### {name} build plan\n{plan[:1200]}"
+        for name, plan in service_build_plans.items()
+    )
+
+    order_text = " → ".join(dependency_order)
+
+    user = f"""## Cross-service feature: {feature_name}
+
+## Dependency order: {order_text}
+
+## Per-service build plans
+{plans_text}
+
+---
+Write the complete cross-service build plan:
+
+# Cross-service build plan: {feature_name}
+
+## Build sequence
+**Dependency order:** {order_text}
+
+## Phase 1 — {dependency_order[0] if dependency_order else '[first service]'}: Foundation
+| Step | Task | Files | Verify |
+|------|------|-------|--------|
+[steps from that service's build plan]
+
+## Phase 1 → 2 Integration check
+- [ ] [contract between phase 1 and phase 2 service is working]
+
+## Phase 2 — [next service]
+...
+
+## Final integration phase
+| Step | Task | Verify |
+|------|------|--------|
+| I01 | End-to-end test: full feature flow | All services return expected responses |
+| I02 | Contract regression test | No existing consumers broken |
+| I03 | Performance test across service boundary | Latency within NFR target |
+
+## Definition of done
+- [ ] All per-service definitions of done met
+- [ ] Integration tests pass
+- [ ] No contract regressions
+- [ ] All NFR targets met end-to-end
+"""
+
+    return backend.call(system, user, max_tokens=2500, _agent="write_cross_service_build_plan")
+
+
+# ── agent 25: write integration test plan ────────────────────────────────────
+
+def write_integration_test_plan(
+    feature_name: str,
+    service_feature_specs: dict[str, str],
+    contract_specs: dict[str, str],
+    config: "SpeckitConfig",
+    project_root: Path,
+) -> str:
+    """~3 500 input / ~2 000 output tokens."""
+    backend = _get_backend(config)
+
+    system = _prompt_override("integration_test_plan", project_root) or """
+You are a QA engineer writing integration tests that span service boundaries.
+RULES:
+- Every test must cross at least one service boundary.
+- Include contract regression tests for each inter-service contract.
+- Include end-to-end user journey tests.
+- Include failure/degradation tests (what happens when one service is slow/down).
+- Return only the markdown document.
+"""
+
+    specs_text = "\n\n---\n\n".join(
+        f"### {name} feature spec\n{spec[:800]}"
+        for name, spec in service_feature_specs.items()
+    )
+
+    contracts_text = "\n\n".join(
+        f"### {name}\n{content[:600]}"
+        for name, content in contract_specs.items()
+    ) or "(no contracts defined)"
+
+    user = f"""## Feature: {feature_name}
+
+## Per-service feature specs
+{specs_text}
+
+## Inter-service contracts
+{contracts_text}
+
+---
+Write the complete integration test plan:
+
+# Integration test plan: {feature_name}
+
+## End-to-end user journey tests
+| ID | Scenario | Services touched | Steps | Expected outcome |
+|----|----------|-----------------|-------|-----------------|
+| E01 | Happy path | [services] | [steps] | [outcome] |
+| E02 | [edge case] | ... | ... | ... |
+
+## Contract regression tests
+For each inter-service contract:
+| ID | Contract | Producer | Consumer | Test | Expected |
+|----|----------|---------|---------|------|---------|
+
+## Failure and degradation tests
+| ID | Failure scenario | Expected behaviour |
+|----|-----------------|-------------------|
+| F01 | [service] is unavailable | [graceful degradation] |
+| F02 | [service] responds slowly (>2s) | [timeout + retry behaviour] |
+
+## Performance tests (cross-boundary)
+| ID | Scenario | SLA target | Test method |
+|----|----------|-----------|------------|
+
+## Test environment requirements
+[What infrastructure/mocks are needed to run these tests]
+"""
+
+    return backend.call(system, user, max_tokens=2500, _agent="write_integration_test_plan")
+
+
+# ── agent 26: plan service topology ──────────────────────────────────────────
+
+def plan_service_topology(
+    feature_name: str,
+    feature_description: str,
+    existing_services_summary: dict[str, str],
+    system_architecture: str,
+    config: "SpeckitConfig",
+    project_root: Path,
+) -> TopologyPlan:
+    """~2 500 input / ~1 000 output tokens."""
+    backend = _get_backend(config)
+
+    system = _prompt_override("plan_service_topology", project_root) or (
+        "You are a senior architect deciding what services need to exist for a feature. "
+        "Be conservative — only create a new service when the feature genuinely can't be "
+        "built inside an existing one. Return JSON only."
+    )
+
+    services_text = "\n".join(
+        f"- {name}: {summary[:400]}"
+        for name, summary in existing_services_summary.items()
+    ) or "(no services registered yet)"
+
+    user = f"""## Feature request
+Name: {feature_name}
+Description: {feature_description}
+
+## System architecture
+{system_architecture[:1500]}
+
+## Existing services
+{services_text}
+
+---
+Decide which existing services need to change and whether any NEW services must be created.
+
+Return JSON only:
+{{
+  "services_to_create": [
+    {{
+      "name": "payments-service",
+      "purpose": "Handle payment processing, refunds, and transaction history",
+      "tech_stack_hint": "Python FastAPI — matches existing backend stack",
+      "depends_on": ["auth-service"]
+    }}
+  ],
+  "services_to_modify": ["backend-api", "frontend"],
+  "reasoning": "One paragraph explaining the topology decision"
+}}
+
+services_to_create is empty if no new service is needed.
+services_to_modify lists existing service names that need feature work.
+"""
+
+    raw = backend.call(system, user, max_tokens=1500, _agent="plan_service_topology")
+    return TopologyPlan(**_parse_json_safe(raw))
+
+
+# ── agent 27: analyze bug service impact ─────────────────────────────────────
+
+def analyze_bug_service_impact(
+    issue_title: str,
+    issue_body: str,
+    classification: "Classification",
+    services_summary: dict[str, str],
+    config: "SpeckitConfig",
+    project_root: Path,
+) -> ServiceImpactResult:
+    """~2 000 input / ~600 output tokens."""
+    backend = _get_backend(config)
+
+    system = _prompt_override("analyze_bug_service_impact", project_root) or (
+        "You are a senior architect determining which microservices are affected by a bug. "
+        "Only include services that need a code change to fix the bug. Return JSON only."
+    )
+
+    services_text = "\n\n".join(
+        f"### {name}\n{summary[:600]}"
+        for name, summary in services_summary.items()
+    )
+
+    user = f"""## Bug report
+Title: {issue_title}
+Type: {classification.issue_type} | Severity: {classification.severity}
+Affected modules: {', '.join(classification.affected_modules)}
+
+{issue_body[:1500]}
+
+## Services
+{services_text}
+
+---
+Which services need a code change to fix this bug?
+Return JSON only:
+{{
+  "impacts": [
+    {{
+      "service_name": "backend-api",
+      "reason": "the null pointer bug is in the payment handler in this service",
+      "scope": "partial",
+      "affected_contracts": ["backend-api__payments.md"]
+    }}
+  ]
+}}
+
+scope: "full" for major changes, "partial" for small targeted fix.
+Only include services that genuinely need a code change.
+"""
+
+    raw = backend.call(system, user, max_tokens=800, _agent="analyze_bug_service_impact")
+    return ServiceImpactResult(**_parse_json_safe(raw))
