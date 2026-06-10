@@ -77,8 +77,23 @@ class FeaturePipeline:
         import re
         return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40]
 
-    def _collect_module_specs_summary(self) -> str:
-        """Return a brief summary of all module specs (name + first 200 chars each)."""
+    def _collect_module_specs_summary(self, query: str = "") -> str:
+        """Return a brief summary of relevant module specs via BM25, or all if no query."""
+        from speckit.adapters.vector_db import search_specs
+        from speckit.core.spec_parser import discover_spec_files
+
+        if query:
+            results = search_specs(
+                query, self.config, self.project_root,
+                top_k=self.config.agent.max_spec_read_files,
+            )
+            if results:
+                return "\n\n".join(
+                    f"### {r['module']}\n{r.get('summary', r.get('content', ''))[:200]}"
+                    for r in results
+                )
+
+        # Fallback: load all module specs from disk
         specs_root = self.project_root / self.config.paths.specs.lstrip("./") / "modules"
         if not specs_root.exists():
             return ""
@@ -149,7 +164,9 @@ class FeaturePipeline:
             # ── 1. Load context specs ─────────────────────────────────────────
             arch_spec = self._read_spec_file("architecture.md")
             sec_spec = self._read_spec_file("security.md")
-            module_summary = self._collect_module_specs_summary()
+            module_summary = self._collect_module_specs_summary(
+                query=f"{feature_name} {feature_description}"
+            )
 
             # ── 2. Research ───────────────────────────────────────────────────
             self._step("Researching implementation patterns")
@@ -222,6 +239,8 @@ class FeaturePipeline:
                 score_obj = judge_feature_spec(
                     spec, arch_spec, sec_spec, self.config, self.project_root
                 )
+                if score_obj is None:
+                    raise RuntimeError("judge_feature_spec returned None on iteration %d" % i)
                 self._step(
                     f"Judge iteration {i}",
                     f"score={score_obj.score:.2f} | {len(score_obj.gaps)} gap(s)",

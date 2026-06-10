@@ -417,6 +417,8 @@ class BugFixPipeline:
                         project_root=self.project_root,
                         previous_test_output=prev_output,
                     )
+                    if not code_plan or not code_plan.changes:
+                        raise RuntimeError("write_code() returned an empty plan — no changes to apply")
                     changed_files = self._apply_code_changes(code_plan)
                     self._step(
                         "Code applied",

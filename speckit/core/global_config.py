@@ -99,6 +99,17 @@ def load_global_config(root: Path) -> GlobalSpeckitConfig:
             config=svc_config,
         ))
 
+    # Validate depends_on references at load time so typos surface immediately
+    service_names = {s.name for s in services}
+    for svc in services:
+        for dep in svc.depends_on:
+            if dep not in service_names:
+                raise ValueError(
+                    f"Service '{svc.name}' depends_on '{dep}', "
+                    f"but '{dep}' is not registered in global.sdd.config.yml.\n"
+                    f"Registered services: {sorted(service_names)}"
+                )
+
     return GlobalSpeckitConfig(
         project_name=raw.get("project_name", root.name),
         root=root,
