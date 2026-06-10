@@ -103,14 +103,19 @@ class _PipelineBase:
         return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40]
 
     def _load_services_summary(self, services: list["ServiceEntry"]) -> dict[str, str]:
-        """Read architecture.md for each service and return {name: content[:800]}."""
+        """Read architecture.md for each service and return {name: content[:800]}.
+        Services with no architecture.md are logged and skipped (not included in summary).
+        """
         summary: dict[str, str] = {}
         for svc in services:
             arch_path = svc.path / svc.config.paths.specs.lstrip("./") / "architecture.md"
             if arch_path.exists():
                 summary[svc.name] = arch_path.read_text(encoding="utf-8")[:800]
             else:
-                summary[svc.name] = f"(no architecture.md found for {svc.name})"
+                self._step(
+                    f"Warning: no architecture.md for {svc.name}",
+                    f"run 'speckit init' in {svc.path} then 'speckit scan' or 'speckit build'",
+                )
         return summary
 
     def _load_contract_specs(self) -> dict[str, str]:
@@ -289,8 +294,13 @@ class OrchestratorPipeline(_PipelineBase):
                 save_global_config(self.gc)
 
             # ── Stage 1: Load full context ────────────────────────────────────
+            # Reuse existing_summary from Stage 0, refreshed to include any newly scaffolded services.
+            # Re-read only if new services were created (their specs were just written to disk).
             self._step("Stage 1 — Loading service context")
-            services_summary = self._load_services_summary(self.gc.services)
+            if topology.services_to_create:
+                services_summary = self._load_services_summary(self.gc.services)
+            else:
+                services_summary = existing_summary  # already loaded in Stage 0 — no re-read
             contract_specs = self._load_contract_specs()
             self._step("Context loaded",
                        f"{len(services_summary)} services | {len(contract_specs)} contracts")

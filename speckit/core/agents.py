@@ -346,7 +346,7 @@ def _parse_json_safe(text: str) -> dict:
                 "changes", "test_command", "summary"):
         # Match the value after "key": — handles strings, arrays, booleans, numbers
         m = re.search(
-            rf'"{key}"\s*:\s*(\[.*?\]|\{{.*?\}}|"(?:[^"\\]|\\.)*"|true|false|[\d.]+)',
+            rf'"{key}"\s*:\s*(\[.*\]|\{{.*\}}|"(?:[^"\\]|\\.)*"|true|false|[\d.]+)',
             cleaned, re.DOTALL,
         )
         if not m:
@@ -1059,10 +1059,10 @@ RULES:
 {compatibility_md[:800]}
 
 ## Architecture spec
-{architecture_spec[:1500]}
+{architecture_spec[:2000]}
 
 ## Security spec
-{security_spec[:800]}
+{security_spec[:1200]}
 
 ---
 Write the complete feature spec:
@@ -1149,10 +1149,10 @@ def judge_feature_spec(
     )
 
     user = f"""## Architecture specification
-{architecture_spec[:1500]}
+{architecture_spec[:2000]}
 
 ## Security specification
-{security_spec[:800]}
+{security_spec[:1200]}
 
 ## Feature spec to review
 {feature_spec_md[:2500]}
@@ -1244,7 +1244,7 @@ RULES:
 {feature_spec_md[:2500]}
 
 ## Architecture
-{architecture_spec[:1000]}
+{architecture_spec[:2000]}
 
 ---
 Write a build plan:
@@ -1713,7 +1713,7 @@ RULES:
 {tech_stack_md[:1000]}
 
 ## Architecture
-{architecture_spec[:1000]}
+{architecture_spec[:2000]}
 
 ## Modules: {', '.join(module_list)}
 
