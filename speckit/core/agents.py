@@ -95,6 +95,80 @@ def get_cost_summary_md() -> str:
     )
 
 
+# ── AI/LLM feature detection ─────────────────────────────────────────────────
+
+_AI_KEYWORDS = frozenset({
+    "ai", "llm", "chatbot", "chat bot", "ai agent", "openai", "anthropic",
+    "claude", "gpt", "gemini", "rag", "embedding", "vector search",
+    "language model", "generative ai", "langchain", "llama", "mistral",
+    "cohere", "completion", "inference", "knowledge base",
+    "conversational", "semantic search", "chat interface", "assistant",
+    "fine-tun", "prompt engineering",
+})
+
+
+def _is_ai_feature(name: str, description: str) -> bool:
+    text = f"{name} {description}".lower()
+    return any(kw in text for kw in _AI_KEYWORDS)
+
+
+_AI_RESEARCH_SUPPLEMENT = """
+## AI/LLM-specific research areas (mandatory for this feature type)
+
+### 1. Semantic caching strategy
+- Which requests qualify for caching (cosine similarity threshold)
+- Cache store: Redis + vector index vs. in-memory vs. dedicated vector DB
+- Cache invalidation policy and TTL
+
+### 2. Token budget and cost control
+- Per-request input + output token cap
+- Per-user daily token budget with enforcement (HTTP 429 when exceeded)
+- Cost circuit breaker (halt new requests if daily spend > threshold)
+- Streaming vs. batch cost trade-offs
+
+### 3. Context window management
+- Conversation history strategy: sliding window / summarization / RAG retrieval
+- Maximum turns before summarization triggers
+- Cheap summarization model vs. primary model for context compression
+
+### 4. Prompt injection and adversarial inputs
+- System prompt isolation (user content never concatenated into system prompt)
+- Input sanitization patterns specific to LLM payloads
+- Jailbreak and prompt-leak detection patterns
+
+### 5. PII handling before external LLM calls
+- PII entity detection (names, emails, phone numbers, IDs, card numbers)
+- Scrubbing vs. masking vs. tokenization — which is appropriate
+- Data processing agreement with LLM provider (do they store inputs?)
+
+### 6. Model reliability and fallback
+- Primary model + fallback chain (e.g. claude-sonnet → claude-haiku → cached response)
+- Retry policy: exponential backoff for 429, immediate fallback for 500
+- Circuit breaker: open after N consecutive LLM failures
+
+### 7. Async / streaming architecture
+- Long agent tasks: async job queue vs. Server-Sent Events vs. WebSocket
+- Progress reporting for multi-step agent runs
+- Request timeout and graceful cancellation
+
+### 8. Audit logging for compliance
+- Log: timestamp, user_id hash, model, input_tokens, output_tokens, latency_ms, cost
+- Do NOT log: raw user messages (may contain PII), raw model output
+- Retention policy and access controls on LLM audit log
+"""
+
+_AI_NFR_ROWS = """\
+| NF07 | AI Cost Control | Token budget enforced per-request and per-user/day; daily spend circuit breaker | Max $X/user/day; p95 request cost < $0.02; circuit breaker fires at 2× daily budget |
+| NF08 | AI Semantic Cache | Semantically similar queries served from cache without LLM call | Cache hit rate > 30% on repeat topics; cache lookup p95 < 50ms |
+| NF09 | AI Safety | Prompt injection blocked; PII scrubbed before any external LLM call | 0 prompt injections reach model; 0 PII fields present in LLM payload |
+| NF10 | AI Reliability | LLM API errors handled with fallback chain; circuit breaker active | p99 availability > 99.5%; fallback fires within 3 consecutive LLM 5xx |
+| NF11 | AI Compliance | All LLM calls audit-logged (hash, tokens, cost); PII absent from log entries | 100% LLM calls in audit log; 0 PII fields in log entries; 90-day retention |
+| NF12 | AI Context | Conversation history managed to stay within model context window | History never exceeds 80% of model max_tokens; summarization triggers at 70% |"""
+
+_AI_JUDGE_DIMENSION = """\
+7. **AI/LLM hygiene** — (AI feature detected) Spec MUST address ALL of: semantic caching strategy, token budget + cost cap per user, prompt injection protection, PII scrubbing before any external LLM call, model fallback chain, async/streaming architecture for long tasks, and LLM audit logging. NFR rows NF07–NF12 must be present with numeric targets. Missing any item is an automatic gap."""
+
+
 # ── backend abstraction ───────────────────────────────────────────────────────
 
 class _AnthropicBackend:
@@ -961,7 +1035,10 @@ Write a research document:
 - [ ] [question needing human decision before building]
 """
 
-    return backend.call(system, user, max_tokens=2500, _agent="research_feature")
+    if _is_ai_feature(feature_name, feature_description):
+        user += _AI_RESEARCH_SUPPLEMENT
+
+    return backend.call(system, user, max_tokens=3000, _agent="research_feature")
 
 
 # ── agent 10: check compatibility ────────────────────────────────────────────
@@ -1048,6 +1125,56 @@ RULES:
 """
 
     slug = feature_name.lower().replace(" ", "-")
+    is_ai = _is_ai_feature(feature_name, feature_description)
+
+    ai_nfr_block = f"\n{_AI_NFR_ROWS}\n" if is_ai else ""
+    ai_section = """
+## AI/LLM-specific requirements
+(Fill in each item — do not leave any as "TBD")
+
+### Semantic cache
+- Similarity threshold for cache hit: [e.g. cosine > 0.92]
+- Cache store + TTL: [e.g. Redis, 1 hour]
+- Cache key design: [how the query is hashed/embedded]
+
+### Token budget and cost control
+- Per-request token cap (input + output): [e.g. 4 096 tokens]
+- Per-user daily budget: [e.g. $0.50/day]
+- Circuit breaker threshold: [e.g. halt at $10/day total]
+- Enforcement: HTTP 429 returned when budget exceeded
+
+### Context window management
+- History strategy: [sliding window / summarization / RAG]
+- Summarization triggers at: [e.g. 70% of model max_tokens]
+- Summarization model: [e.g. claude-haiku-4-5 for cost efficiency]
+
+### Prompt injection protection
+- User input handling: [never interpolated into system prompt; treated as data only]
+- Detection approach: [e.g. input classifier / pattern matching]
+- Response on detection: HTTP 400 with generic error, log attempt
+
+### PII scrubbing
+- PII types in scope: [names / emails / phone / national IDs / card numbers]
+- Scrub strategy: [regex + NER model / 3rd party scrubber]
+- Verification: unit tests assert scrubbed payload before mock LLM call
+
+### Model fallback chain
+- Primary: [e.g. claude-sonnet-4-6]
+- Fallback 1: [e.g. claude-haiku-4-5]
+- Fallback 2: [e.g. cached best-match response]
+- Circuit breaker: open after [N] consecutive failures, half-open after [X]s
+
+### Async / streaming
+- Response delivery: [SSE / WebSocket / polling]
+- Long-task timeout: [e.g. 60s hard limit]
+- Cancellation: [how user can cancel an in-progress generation]
+
+### Audit logging
+- Log fields: timestamp, user_id_hash, model, input_tokens, output_tokens, latency_ms, cost_usd
+- NOT logged: raw message content (PII risk)
+- Retention: [e.g. 90 days, then purge]
+- Access: [e.g. ops team only, no dev access to prod logs]
+""" if is_ai else ""
 
     user = f"""## Feature request
 {feature_description}
@@ -1095,8 +1222,7 @@ As a [user type], I want [capability], so that [outcome].
 | NF03 | Scalability | [requirement] | [measurable target e.g. supports 10k concurrent users, horizontal scale-out] |
 | NF04 | Reliability | [requirement] | [measurable target e.g. 99.9% uptime, RTO < 5 min, zero data loss] |
 | NF05 | Maintainability | [requirement] | [measurable target e.g. cyclomatic complexity < 10, test coverage > 80%] |
-| NF06 | Observability | [requirement] | [measurable target e.g. all errors logged with trace ID, p99 latency tracked] |
-
+| NF06 | Observability | [requirement] | [measurable target e.g. all errors logged with trace ID, p99 latency tracked] |{ai_nfr_block}
 ## Data model changes
 ### New entities (if any)
 [entity name, fields, types, relationships — or write "None"]
@@ -1126,9 +1252,10 @@ As a [user type], I want [capability], so that [outcome].
 
 ## Open questions
 - [ ] [question needing human decision]
-"""
+{ai_section}"""
 
-    return backend.call(system, user, max_tokens=2800, _agent="write_feature_spec")
+    max_out = 3500 if is_ai else 2800
+    return backend.call(system, user, max_tokens=max_out, _agent="write_feature_spec")
 
 
 # ── agent 12: judge feature spec ─────────────────────────────────────────────
@@ -1148,6 +1275,10 @@ def judge_feature_spec(
         "Be rigorous. Return JSON only."
     )
 
+    is_ai = _is_ai_feature(feature_spec_md[:200], feature_spec_md[200:500])
+    ai_dimension = f"\n{_AI_JUDGE_DIMENSION}" if is_ai else ""
+    dim_count = "seven" if is_ai else "six"
+
     user = f"""## Architecture specification
 {architecture_spec[:2000]}
 
@@ -1158,14 +1289,14 @@ def judge_feature_spec(
 {feature_spec_md[:2500]}
 
 ---
-Score on six dimensions (0-1 each, equal weight):
+Score on {dim_count} dimensions (0-1 each, equal weight):
 
 1. **Completeness** — All sections filled, no TODOs or "TBD" without justification
 2. **Testability** — Every FR starts with "System shall" or "User can" and is verifiable
 3. **Architecture alignment** — Feature fits the principles without conflicts
 4. **Security** — Auth, input validation, and attack surface are addressed
 5. **Measurability** — Every NFR row has a concrete, numeric target (not vague words like "fast" or "reliable")
-6. **NFR coverage** — The NFR table contains rows for ALL of: Performance, Security, Scalability, Reliability, Maintainability, and Observability — missing any of these is an automatic gap
+6. **NFR coverage** — The NFR table contains rows for ALL of: Performance, Security, Scalability, Reliability, Maintainability, and Observability — missing any of these is an automatic gap{ai_dimension}
 
 Return JSON only:
 {{
