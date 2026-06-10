@@ -245,7 +245,11 @@ class BugFixPipeline:
         If `issue` is provided, GitHub fetch is skipped — useful for
         --no-github mode where the user enters issue details manually.
         """
-        from speckit.core.agents import draft_bug_report, write_test_plan, reset_cost_log, get_cost_summary_md
+        from speckit.core.agents import (
+            draft_bug_report, write_test_plan, reset_cost_log, get_cost_summary_md,
+            set_pipeline_cache, clear_pipeline_cache,
+            review_generated_code, scan_for_secrets,
+        )
         from speckit.core.judge import run_judge_loop
         from speckit.adapters.slack import SlackNotifier
         reset_cost_log()
@@ -302,72 +306,95 @@ class BugFixPipeline:
             arch_spec = self._read_spec_file("architecture.md")
             sec_spec = self._read_spec_file("security.md")
             learnings = self._read_spec_file("global_learnings.md")
+            set_pipeline_cache(arch_spec, sec_spec, learnings)
 
-            # ── 6. Draft bug report ───────────────────────────────────────────
-            self._step("Drafting bug report")
-            draft = draft_bug_report(
-                issue.title, issue.body, classification,
-                spec_results, source_files, learnings,
-                self.config, self.project_root,
-            )
-            self._write(
-                "02_bug_report.md",
-                draft + "\n\n---\n*status: draft — pending judge*",
-            )
-            result.artifacts.append("02_bug_report.md")
+            # ── 6. Draft bug report (skip if already approved) ────────────────
+            run_dir = self._run_dir
+            existing_report = (run_dir / "02_bug_report.md").read_text(encoding="utf-8") \
+                if run_dir and (run_dir / "02_bug_report.md").exists() else None
+            report_approved = existing_report is not None and "judge-approved" in existing_report
 
-            # ── 7. Judge loop ─────────────────────────────────────────────────
-            self._step("Starting judge loop", f"threshold={self.config.agent.judge_threshold}")
-
-            def _on_judge_iter(i: int, score: float, gaps: list[str]) -> None:
-                self._step(
-                    f"Judge iteration {i}",
-                    f"score={score:.2f} | {len(gaps)} gap(s)",
+            if report_approved:
+                from speckit.core.judge import JudgeResult
+                import re as _re
+                _s = _re.search(r"score:\s*([\d.]+)", existing_report)
+                _it = _re.search(r"iterations:\s*(\d+)", existing_report)
+                judge_result = JudgeResult(
+                    final_spec=existing_report,
+                    final_score=float(_s.group(1)) if _s else self.config.agent.judge_threshold,
+                    iterations=int(_it.group(1)) if _it else 1,
+                    approved=True,
                 )
-
-            judge_result = run_judge_loop(
-                draft=draft,
-                architecture_spec=arch_spec,
-                security_spec=sec_spec,
-                config=self.config,
-                project_root=self.project_root,
-                on_iteration=_on_judge_iter,
-            )
-
-            result.judge_score = judge_result.final_score
-            result.judge_iterations = judge_result.iterations
-            result.approved = judge_result.approved
-
-            status_tag = (
-                "judge-approved"
-                if judge_result.approved
-                else "needs-human-review"
-            )
-            self._write(
-                "02_bug_report.md",
-                judge_result.final_spec
-                + f"\n\n---\n*status: {status_tag} | "
-                f"score: {judge_result.final_score:.2f} | "
-                f"iterations: {judge_result.iterations}*",
-            )
-
-            if judge_result.approved:
-                self._step(
-                    "Bug report approved",
-                    f"score={judge_result.final_score:.2f} in {judge_result.iterations} iteration(s)",
-                )
+                result.judge_score = judge_result.final_score
+                result.judge_iterations = judge_result.iterations
+                result.approved = True
+                self._step("Reusing approved bug report", "02_bug_report.md")
+                result.artifacts.append("02_bug_report.md")
             else:
-                self._step(
-                    "Judge threshold not met — human review required",
-                    f"score={judge_result.final_score:.2f} < {self.config.agent.judge_threshold}",
+                self._step("Drafting bug report")
+                draft = draft_bug_report(
+                    issue.title, issue.body, classification,
+                    spec_results, source_files, learnings,
+                    self.config, self.project_root,
                 )
-                slack.judge_failed(
-                    run_type="bug-fix",
-                    name=f"issue #{issue_number}",
-                    score=judge_result.final_score,
-                    threshold=self.config.agent.judge_threshold,
-                    gaps=[],
+                self._write(
+                    "02_bug_report.md",
+                    draft + "\n\n---\n*status: draft — pending judge*",
                 )
+                result.artifacts.append("02_bug_report.md")
+
+                # ── 7. Judge loop ─────────────────────────────────────────────
+                self._step("Starting judge loop", f"threshold={self.config.agent.judge_threshold}")
+
+                def _on_judge_iter(i: int, score: float, gaps: list[str]) -> None:
+                    self._step(
+                        f"Judge iteration {i}",
+                        f"score={score:.2f} | {len(gaps)} gap(s)",
+                    )
+
+                judge_result = run_judge_loop(
+                    draft=draft,
+                    architecture_spec=arch_spec,
+                    security_spec=sec_spec,
+                    config=self.config,
+                    project_root=self.project_root,
+                    on_iteration=_on_judge_iter,
+                )
+
+                result.judge_score = judge_result.final_score
+                result.judge_iterations = judge_result.iterations
+                result.approved = judge_result.approved
+
+                status_tag = (
+                    "judge-approved"
+                    if judge_result.approved
+                    else "needs-human-review"
+                )
+                self._write(
+                    "02_bug_report.md",
+                    judge_result.final_spec
+                    + f"\n\n---\n*status: {status_tag} | "
+                    f"score: {judge_result.final_score:.2f} | "
+                    f"iterations: {judge_result.iterations}*",
+                )
+
+                if judge_result.approved:
+                    self._step(
+                        "Bug report approved",
+                        f"score={judge_result.final_score:.2f} in {judge_result.iterations} iteration(s)",
+                    )
+                else:
+                    self._step(
+                        "Judge threshold not met — human review required",
+                        f"score={judge_result.final_score:.2f} < {self.config.agent.judge_threshold}",
+                    )
+                    slack.judge_failed(
+                        run_type="bug-fix",
+                        name=f"issue #{issue_number}",
+                        score=judge_result.final_score,
+                        threshold=self.config.agent.judge_threshold,
+                        gaps=[],
+                    )
 
             # ── 8. Test plan ─────────────────────────────────────────────────
             self._step("Writing test plan")
@@ -457,8 +484,66 @@ class BugFixPipeline:
                     )
                     result.artifacts.append("05_test_results.md")
 
-                # Commit + PR (only if tests passed and GitHub connected)
-                if test_result and test_result.passed and self.github and changed_files:
+                # ── Code review (agent 28) before commit ──────────────────────
+                if code_plan and test_result and test_result.passed:
+                    self._step("Running code review")
+                    code_review = review_generated_code(
+                        spec_md=judge_result.final_spec,
+                        code_changes=[
+                            {"file": c.file, "action": c.action,
+                             "content": c.content, "explanation": c.explanation}
+                            for c in code_plan.changes
+                        ],
+                        architecture_spec=arch_spec,
+                        config=self.config,
+                        project_root=self.project_root,
+                    )
+                    review_lines = (
+                        f"# Code review\n\n"
+                        f"**Score:** {code_review.score:.2f} | "
+                        f"**Approved:** {code_review.approved}\n\n"
+                    )
+                    if code_review.blocking_issues:
+                        review_lines += "## Blocking issues\n" + "\n".join(
+                            f"- {i}" for i in code_review.blocking_issues
+                        ) + "\n\n"
+                    if code_review.warnings:
+                        review_lines += "## Warnings\n" + "\n".join(
+                            f"- {w}" for w in code_review.warnings
+                        ) + "\n\n"
+                    review_lines += f"## Feedback\n{code_review.feedback}\n"
+                    self._write("06_code_review.md", review_lines)
+                    result.artifacts.append("06_code_review.md")
+                    if not code_review.approved:
+                        self._step(
+                            "Code review failed — human review required before merge",
+                            f"score={code_review.score:.2f}, "
+                            f"{len(code_review.blocking_issues)} blocking issue(s)",
+                        )
+
+                # ── Secrets scan before PR ─────────────────────────────────────
+                secrets_found: list[str] = []
+                if code_plan:
+                    secrets_found = scan_for_secrets(code_plan.changes)
+                    if secrets_found:
+                        self._step(
+                            "SECRETS DETECTED in generated code — aborting PR",
+                            "; ".join(secrets_found),
+                        )
+                        self._write(
+                            "SECRETS_DETECTED.md",
+                            "# Secrets detected\n\n"
+                            "The following potential secrets were found in generated code.\n"
+                            "Review and remove before committing.\n\n"
+                            + "\n".join(f"- {s}" for s in secrets_found),
+                        )
+
+                # Commit + PR (only if tests passed, no secrets, GitHub connected)
+                if (
+                    test_result and test_result.passed
+                    and self.github and changed_files
+                    and not secrets_found
+                ):
                     self._step("Committing changes")
                     self._git("add", *changed_files)
                     self._git(
@@ -468,12 +553,23 @@ class BugFixPipeline:
                     )
                     self._git("push", "-u", "origin", branch_name)
 
+                    code_review_note = ""
+                    if code_plan and (run_dir / "06_code_review.md").exists():
+                        cr = review_generated_code.__module__  # just to confirm import
+                        _cr_txt = (run_dir / "06_code_review.md").read_text(encoding="utf-8")
+                        _approved = "judge-approved" not in _cr_txt and "Approved: False" not in _cr_txt
+                        code_review_note = (
+                            "\n\n⚠️ **Code review flagged issues** — see `06_code_review.md`."
+                            if not code_review.approved else
+                            "\n\n✅ Code review passed."
+                        ) if 'code_review' in dir() else ""
+
                     pr_body = (
                         f"## Summary\n\nFixes #{issue_number}: {issue.title}\n\n"
                         f"{code_plan.summary}\n\n"
                         f"## Changes\n"
                         + "\n".join(f"- `{c.file}`: {c.explanation}" for c in code_plan.changes)
-                        + f"\n\n## Test results\nAll tests passed.\n\n"
+                        + f"\n\n## Test results\nAll tests passed.{code_review_note}\n\n"
                         f"---\n*Generated by speckit — review before merging.*"
                     )
                     pr = self.github.create_pr(
@@ -525,5 +621,7 @@ class BugFixPipeline:
                 + "\n".join(self._log_lines),
             )
             raise
+        finally:
+            clear_pipeline_cache()
 
         return result

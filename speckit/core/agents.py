@@ -82,17 +82,80 @@ def get_cost_summary_md() -> str:
         return ""
     total_in = sum(e["input_tokens"] for e in _cost_log)
     total_out = sum(e["output_tokens"] for e in _cost_log)
+    total_cache_read = sum(e.get("cache_read_tokens", 0) for e in _cost_log)
+    total_cache_write = sum(e.get("cache_write_tokens", 0) for e in _cost_log)
     rows = "\n".join(
         f"| {e['agent']:<32} | {e['input_tokens']:>8,} | {e['output_tokens']:>8,} |"
         for e in _cost_log
     )
+    cache_line = ""
+    if total_cache_read or total_cache_write:
+        cache_line = (
+            f"\n\n**Prompt cache:** {total_cache_write:,} tokens written, "
+            f"{total_cache_read:,} tokens served from cache "
+            f"(saved ~{int(total_cache_read * 0.9):,} billable tokens)"
+        )
     return (
         "\n## Token usage\n\n"
         "| Agent                            | Input tkns | Output tkns |\n"
         "|----------------------------------|-----------|-------------|\n"
         f"{rows}\n"
         f"| **Total**                        | **{total_in:>7,}** | **{total_out:>8,}** |"
+        f"{cache_line}"
     )
+
+
+# ── pipeline-level prompt cache ───────────────────────────────────────────────
+
+_pipeline_cache_context: str = ""
+_CACHE_MIN_CHARS = 3000  # ~1 024 tokens — Anthropic's minimum cacheable prefix
+
+
+def set_pipeline_cache(
+    arch_spec: str,
+    security_spec: str,
+    learnings: str = "",
+) -> None:
+    """
+    Call once at pipeline start. All subsequent _AnthropicBackend.call() calls
+    within this process will inject this context as a cached first content block,
+    paying 0.10× on cache hits instead of 1× for every agent call.
+    """
+    global _pipeline_cache_context
+    parts: list[str] = []
+    if arch_spec:
+        parts.append(f"## Architecture specification\n{arch_spec[:2000]}")
+    if security_spec:
+        parts.append(f"## Security specification\n{security_spec[:1200]}")
+    if learnings:
+        parts.append(f"## Global learnings\n{learnings[:800]}")
+    _pipeline_cache_context = "\n\n".join(parts)
+
+
+def clear_pipeline_cache() -> None:
+    global _pipeline_cache_context
+    _pipeline_cache_context = ""
+
+
+def _arch_block(arch: str) -> str:
+    """Return formatted arch section for user prompt; empty when pipeline cache is active."""
+    if _pipeline_cache_context:
+        return ""
+    return f"\n## Architecture specification\n{arch[:2000]}\n"
+
+
+def _sec_block(sec: str) -> str:
+    """Return formatted security section; empty when pipeline cache is active."""
+    if _pipeline_cache_context:
+        return ""
+    return f"\n## Security specification\n{sec[:1200]}\n"
+
+
+def _learnings_block(learnings: str) -> str:
+    """Return formatted learnings section; empty when pipeline cache is active."""
+    if _pipeline_cache_context or not learnings:
+        return ""
+    return f"\n## Global learnings (avoid these mistakes, follow these patterns)\n{learnings[:800]}\n"
 
 
 # ── AI/LLM feature detection ─────────────────────────────────────────────────
@@ -177,12 +240,27 @@ class _AnthropicBackend:
         self.model = model
 
     def call(self, system: str, user: str, max_tokens: int, _agent: str = "") -> str:
+        # Inject pipeline cache as a cacheable first user content block when large enough
+        if _pipeline_cache_context and len(_pipeline_cache_context) >= _CACHE_MIN_CHARS:
+            messages = [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": _pipeline_cache_context,
+                        "cache_control": {"type": "ephemeral"},
+                    },
+                    {"type": "text", "text": user.strip()},
+                ],
+            }]
+        else:
+            messages = [{"role": "user", "content": user.strip()}]
         try:
             resp = self._client.messages.create(
                 model=self.model,
                 max_tokens=max_tokens,
                 system=system.strip(),
-                messages=[{"role": "user", "content": user.strip()}],
+                messages=messages,
             )
         except anthropic.BadRequestError as e:
             msg = str(e)
@@ -202,6 +280,8 @@ class _AnthropicBackend:
             "agent": _agent or "unknown",
             "input_tokens": resp.usage.input_tokens,
             "output_tokens": resp.usage.output_tokens,
+            "cache_read_tokens": getattr(resp.usage, "cache_read_input_tokens", 0) or 0,
+            "cache_write_tokens": getattr(resp.usage, "cache_creation_input_tokens", 0) or 0,
         })
         return resp.content[0].text.strip()
 
@@ -234,12 +314,19 @@ class _GeminiBackend:
         return resp.text.strip()
 
 
-def _get_backend(config: "SpeckitConfig") -> _AnthropicBackend | _GeminiBackend:
+def _get_backend(
+    config: "SpeckitConfig",
+    prefer_fast: bool = False,
+) -> _AnthropicBackend | _GeminiBackend:
     """
     Return the best available LLM backend.
 
+    prefer_fast=True routes to cheaper/faster models (Haiku / Flash-Lite) for
+    structured-output agents (classify, judge, compat-check) where creativity
+    is not needed.
+
     Detection order (first match wins):
-      1. GEMINI_VERTEX=true          → Gemini 2.0 Flash on Vertex AI
+      1. GEMINI_VERTEX=true          → Gemini on Vertex AI
       2. GEMINI_API_KEY              → Gemini via Google AI Studio (free tier)
       3. ANTHROPIC_VERTEX_PROJECT_ID → Claude on Vertex AI
       4. ANTHROPIC_API_KEY           → Anthropic direct API
@@ -259,14 +346,17 @@ def _get_backend(config: "SpeckitConfig") -> _AnthropicBackend | _GeminiBackend:
             )
         region = os.environ.get("GEMINI_VERTEX_REGION", "us-central1")
         client = ggenai.Client(vertexai=True, project=project, location=region)
-        model = os.environ.get("GEMINI_MODEL", "publishers/google/models/gemini-2.5-flash-lite")
+        default = "publishers/google/models/gemini-2.5-flash-lite"
+        fast = "publishers/google/models/gemini-2.0-flash-lite"
+        model = fast if prefer_fast else os.environ.get("GEMINI_MODEL", default)
         return _GeminiBackend(client, model)
 
     # 2. Gemini via Google AI Studio (free API key)
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     if gemini_key:
         client = ggenai.Client(api_key=gemini_key)
-        model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+        fast = "gemini-2.0-flash-lite"
+        model = fast if prefer_fast else os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
         return _GeminiBackend(client, model)
 
     # 3. Claude on Vertex AI
@@ -282,13 +372,17 @@ def _get_backend(config: "SpeckitConfig") -> _AnthropicBackend | _GeminiBackend:
             "claude-sonnet-4-6": "claude-sonnet-4-5@20251001",
             "claude-haiku-4-5":  "claude-haiku-4-5@20251001",
         }
-        model = _MAP.get(config.agent.model, config.agent.model)
+        if prefer_fast:
+            model = "claude-haiku-4-5@20251001"
+        else:
+            model = _MAP.get(config.agent.model, config.agent.model)
         return _AnthropicBackend(client, model)
 
     # 4. Anthropic direct API
     key = os.environ.get("ANTHROPIC_API_KEY", "")
     if key and key not in ("paste-your-key-here", "sk-ant-..."):
-        return _AnthropicBackend(anthropic.Anthropic(api_key=key), config.agent.model)
+        model = "claude-haiku-4-5-20251001" if prefer_fast else config.agent.model
+        return _AnthropicBackend(anthropic.Anthropic(api_key=key), model)
 
     raise EnvironmentError(
         "No LLM credentials found. Add one of these to .env:\n\n"
@@ -456,7 +550,7 @@ def classify_issue(
     project_root: Path,
 ) -> Classification:
     """~500 input / ~200 output tokens."""
-    backend = _get_backend(config)
+    backend = _get_backend(config, prefer_fast=True)
 
     system = _prompt_override("classify", project_root) or (
         "You are a software issue classifier. "
@@ -529,9 +623,7 @@ Affected modules: {', '.join(classification.affected_modules)}
 ## Relevant spec files
 {specs_text}
 
-## Global learnings (avoid these mistakes, follow these patterns)
-{global_learnings[:800] if global_learnings else 'No learnings recorded yet.'}
-
+{_learnings_block(global_learnings) or f"## Global learnings (avoid these mistakes, follow these patterns)\n{global_learnings[:800] if global_learnings else 'No learnings recorded yet.'}\n"}
 ## Source files (relevant excerpts)
 {source_text}
 
@@ -606,20 +698,14 @@ def judge_bug_report(
     project_root: Path,
 ) -> JudgeScore:
     """~2 500 input / ~400 output tokens."""
-    backend = _get_backend(config)
+    backend = _get_backend(config, prefer_fast=True)
 
     system = _prompt_override("judge", project_root) or (
         "You are a senior software architect reviewing an AI-generated bug report. "
         "Be rigorous. Return JSON only."
     )
 
-    user = f"""## Architecture specification
-{architecture_spec[:2000]}
-
-## Security specification
-{security_spec[:1200]}
-
-## Bug report to review
+    user = f"""{_arch_block(architecture_spec)}{_sec_block(security_spec)}## Bug report to review
 {bug_report_md[:2800]}
 
 ---
@@ -892,17 +978,29 @@ def write_code(
     config: "SpeckitConfig",
     project_root: Path,
     previous_test_output: str = "",
+    mode: str = "fix",  # "fix" | "feature"
 ) -> CodePlan:
     """~4 000 input / ~3 000 output tokens."""
     backend = _get_coding_backend(config)
 
-    system = _prompt_override("write_code", project_root) or """
-You are a senior software engineer implementing a bug fix.
+    _mode_instructions = {
+        "fix": (
+            "Make the MINIMAL change that fixes the root cause described in the bug report.\n"
+            "- Never introduce new dependencies unless the bug report explicitly requires them.\n"
+            "- Never remove existing functionality unrelated to the fix."
+        ),
+        "feature": (
+            "Implement the feature exactly as described in the feature spec and build plan.\n"
+            "- Follow the architecture principles in the spec.\n"
+            "- Implement ALL functional requirements — do not skip any.\n"
+            "- Implement security requirements (auth, validation, rate limiting) from NFR section."
+        ),
+    }
+    system = _prompt_override("write_code", project_root) or f"""
+You are a senior software engineer implementing a {mode if mode == "feature" else "bug fix"}.
 RULES:
-- Make the MINIMAL change that fixes the root cause described in the bug report.
+- {_mode_instructions.get(mode, _mode_instructions["fix"])}
 - Output FULL file contents for every modified file — not diffs or snippets.
-- Never introduce new dependencies unless the bug report explicitly requires them.
-- Never remove existing functionality unrelated to the fix.
 - Return JSON only — no markdown, no explanation outside the JSON.
 """
 
@@ -997,7 +1095,7 @@ Description: {feature_description}
 
 ## Project architecture
 Language: {language}
-{architecture_spec[:2000]}
+{_arch_block(architecture_spec) or architecture_spec[:2000]}
 
 ---
 Write a research document:
@@ -1052,7 +1150,7 @@ def check_compatibility(
     project_root: Path,
 ) -> CompatibilityResult:
     """~2 500 input / ~600 output tokens."""
-    backend = _get_backend(config)
+    backend = _get_backend(config, prefer_fast=True)
 
     system = _prompt_override("check_compatibility", project_root) or (
         "You are a software architect checking if a proposed feature fits the project's "
@@ -1062,10 +1160,7 @@ def check_compatibility(
     user = f"""## Proposed feature
 Name: {feature_name}
 Description: {feature_description}
-
-## Architecture specification
-{architecture_spec[:2000]}
-
+{_arch_block(architecture_spec)}
 ## Existing module summary
 {module_specs_summary[:1500]}
 
@@ -1185,12 +1280,7 @@ RULES:
 ## Compatibility assessment
 {compatibility_md[:800]}
 
-## Architecture spec
-{architecture_spec[:2000]}
-
-## Security spec
-{security_spec[:1200]}
-
+{_arch_block(architecture_spec) or f"## Architecture spec\n{architecture_spec[:2000]}\n"}{_sec_block(security_spec) or f"## Security spec\n{security_spec[:1200]}\n"}
 ---
 Write the complete feature spec:
 
@@ -1268,7 +1358,7 @@ def judge_feature_spec(
     project_root: Path,
 ) -> JudgeScore:
     """~3 000 input / ~600 output tokens."""
-    backend = _get_backend(config)
+    backend = _get_backend(config, prefer_fast=True)
 
     system = _prompt_override("judge_feature", project_root) or (
         "You are a senior product and architecture reviewer. "
@@ -1279,13 +1369,7 @@ def judge_feature_spec(
     ai_dimension = f"\n{_AI_JUDGE_DIMENSION}" if is_ai else ""
     dim_count = "seven" if is_ai else "six"
 
-    user = f"""## Architecture specification
-{architecture_spec[:2000]}
-
-## Security specification
-{security_spec[:1200]}
-
-## Feature spec to review
+    user = f"""{_arch_block(architecture_spec) or f"## Architecture specification\n{architecture_spec[:2000]}\n"}{_sec_block(security_spec) or f"## Security specification\n{security_spec[:1200]}\n"}## Feature spec to review
 {feature_spec_md[:2500]}
 
 ---
@@ -1373,10 +1457,7 @@ RULES:
 
     user = f"""## Approved feature spec
 {feature_spec_md[:2500]}
-
-## Architecture
-{architecture_spec[:2000]}
-
+{_arch_block(architecture_spec) or f"## Architecture\n{architecture_spec[:2000]}\n"}
 ---
 Write a build plan:
 
@@ -1843,9 +1924,7 @@ RULES:
 ## Tech stack
 {tech_stack_md[:1000]}
 
-## Architecture
-{architecture_spec[:2000]}
-
+{_arch_block(architecture_spec) or f"## Architecture\n{architecture_spec[:2000]}\n"}
 ## Modules: {', '.join(module_list)}
 
 ---
@@ -1972,7 +2051,7 @@ def analyze_service_impact(
     project_root: Path,
 ) -> ServiceImpactResult:
     """~2 000 input / ~600 output tokens."""
-    backend = _get_backend(config)
+    backend = _get_backend(config, prefer_fast=True)
 
     system = _prompt_override("analyze_service_impact", project_root) or (
         "You are a senior architect analysing which microservices a proposed feature will touch. "
@@ -2342,7 +2421,7 @@ def analyze_bug_service_impact(
     project_root: Path,
 ) -> ServiceImpactResult:
     """~2 000 input / ~600 output tokens."""
-    backend = _get_backend(config)
+    backend = _get_backend(config, prefer_fast=True)
 
     system = _prompt_override("analyze_bug_service_impact", project_root) or (
         "You are a senior architect determining which microservices are affected by a bug. "
@@ -2384,3 +2463,124 @@ Only include services that genuinely need a code change.
 
     raw = backend.call(system, user, max_tokens=800, _agent="analyze_bug_service_impact")
     return ServiceImpactResult(**_parse_json_safe(raw))
+
+
+# ── agent 28: review generated code ──────────────────────────────────────────
+
+class CodeReviewResult(BaseModel):
+    score: float
+    approved: bool
+    blocking_issues: list[str]   # must fix before merge
+    warnings: list[str]          # should fix, not blocking
+    feedback: str
+
+
+def review_generated_code(
+    spec_md: str,
+    code_changes: list[dict],
+    architecture_spec: str,
+    config: "SpeckitConfig",
+    project_root: Path,
+) -> CodeReviewResult:
+    """
+    Review AI-generated code changes against the driving spec.
+    ~5 000 input / ~800 output tokens.
+    """
+    backend = _get_backend(config, prefer_fast=False)
+
+    changes_text = "\n\n".join(
+        f"### {c.get('file', '?')} ({c.get('action', 'modify')})\n"
+        f"```\n{c.get('content', '')[:1800]}\n```\n"
+        f"Explanation: {c.get('explanation', 'none')}"
+        for c in code_changes[:5]
+    ) or "(no code changes)"
+
+    system = _prompt_override("review_code", project_root) or (
+        "You are a senior code reviewer checking AI-generated code against its driving spec. "
+        "Be rigorous. Return JSON only."
+    )
+
+    user = f"""{_arch_block(architecture_spec) or f"## Architecture\n{architecture_spec[:1500]}\n"}
+## Spec / plan that drove this code
+{spec_md[:2500]}
+
+## Generated code changes
+{changes_text}
+
+---
+Review the code against the spec. Score 0-1 (average of dimensions below). Return JSON only:
+{{
+  "score": 0.0,
+  "approved": false,
+  "blocking_issues": ["specific issue that must be fixed before merge"],
+  "warnings": ["should fix but not blocking"],
+  "feedback": "one paragraph of actionable guidance"
+}}
+
+Score dimensions (equal weight):
+
+**Blocking — any failure here is a blocking_issue:**
+1. Every FR in the spec has corresponding implementation
+2. Security requirements implemented (auth, validation, rate limiting, no injection)
+3. No hardcoded secrets, tokens, or credentials in code
+4. No obviously broken logic (unhandled None, missing error handling on IO calls)
+5. No new external dependencies absent from the spec
+
+**Warnings only (lower score but not blocking):**
+- Missing docstrings on public functions
+- Minor style inconsistencies vs. architecture coding standards
+- Test coverage not visibly increased
+
+Set approved=true only if score >= {config.agent.judge_threshold} and blocking_issues is empty.
+"""
+
+    raw = backend.call(system, user, max_tokens=1200, _agent="review_generated_code")
+    data = _parse_json_safe(raw)
+    data["approved"] = (
+        float(data.get("score", 0)) >= config.agent.judge_threshold
+        and not data.get("blocking_issues")
+    )
+    return CodeReviewResult(**data)
+
+
+# ── secrets scanner (pre-PR safety net) ──────────────────────────────────────
+
+import re as _re
+
+_SECRET_PATTERNS: list[tuple[str, str]] = [
+    (r'sk-[a-zA-Z0-9]{20,}', "Possible OpenAI/Anthropic API key"),
+    (r'sk-ant-[a-zA-Z0-9\-]{20,}', "Possible Anthropic API key"),
+    (r'ghp_[a-zA-Z0-9]{36,}', "Possible GitHub personal access token"),
+    (r'ghs_[a-zA-Z0-9]{36,}', "Possible GitHub app token"),
+    (r'AKIA[0-9A-Z]{16}', "Possible AWS access key ID"),
+    (r'AIza[0-9A-Za-z_\-]{35}', "Possible Google API key"),
+    (r'-----BEGIN (?:RSA |DSA |EC |OPENSSH )?PRIVATE KEY-----', "Private key block"),
+    (
+        r'(?i)(?:password|passwd|secret|api[_-]?key|auth[_-]?token|access[_-]?token)'
+        r'\s*[=:]\s*["\'](?!placeholder|example|your[_-]|<|TODO|ENV|os\.)[^"\']{8,}["\']',
+        "Possible hardcoded credential",
+    ),
+]
+
+
+def scan_for_secrets(code_changes: list) -> list[str]:
+    """
+    Scan generated code changes for hardcoded secrets before PR creation.
+
+    Accepts either a list of CodeChange objects or dicts with 'file'/'content' keys.
+    Returns a list of human-readable finding strings (empty = clean).
+    """
+    findings: list[str] = []
+    for change in code_changes:
+        if hasattr(change, "file"):
+            file_path, content = change.file, change.content
+        else:
+            file_path, content = change.get("file", "?"), change.get("content", "")
+
+        for pattern, label in _SECRET_PATTERNS:
+            match = _re.search(pattern, content)
+            if match:
+                snippet = match.group(0)[:60]
+                findings.append(f"{label} in {file_path}: `{snippet}...`")
+
+    return findings
