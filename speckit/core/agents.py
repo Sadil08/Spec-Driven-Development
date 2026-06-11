@@ -359,10 +359,102 @@ class _GeminiBackend:
         return resp.text.strip()
 
 
+def _find_claude_cli() -> str:
+    """
+    Locate the Claude Code CLI binary.
+
+    Checks PATH first, then the binary bundled inside the VSCode extension
+    (newest version wins). Returns "" if not found.
+    """
+    import glob
+    import shutil as _shutil
+
+    on_path = _shutil.which("claude")
+    if on_path:
+        return on_path
+    candidates = sorted(glob.glob(
+        os.path.expanduser(
+            "~/.vscode/extensions/anthropic.claude-code-*/resources/native-binary/claude"
+        )
+    ))
+    for path in reversed(candidates):
+        if os.access(path, os.X_OK):
+            return path
+    return ""
+
+
+class _ClaudeCLIBackend:
+    """
+    LLM backend that shells out to the Claude Code CLI (`claude -p`).
+
+    Uses the Claude Pro/Max subscription login (~/.claude) instead of an API
+    key — zero marginal cost, but consumes the subscription's usage quota and
+    is subject to its 5-hour rate-limit windows. ANTHROPIC_API_KEY is stripped
+    from the child environment so a stray key can never cause API billing.
+    """
+    def __init__(self, cli_path: str, model: str):
+        self._cli = cli_path
+        self.model = model
+
+    def call(self, system: str, user: str, max_tokens: int, _agent: str = "") -> str:
+        import subprocess
+
+        cache_context = _get_cache_context()
+        prompt = user.strip()
+        if cache_context and len(cache_context) >= _CACHE_MIN_CHARS:
+            prompt = cache_context + "\n\n" + prompt
+
+        env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+        cmd = [
+            self._cli, "-p",
+            "--output-format", "json",
+            "--model", self.model,
+            "--max-turns", "1",
+            "--system-prompt", system.strip(),
+        ]
+        try:
+            proc = subprocess.run(
+                cmd, input=prompt, capture_output=True, text=True,
+                env=env, timeout=900,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"claude CLI call timed out after 900s (agent: {_agent})") from None
+
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()[:500]
+            if "rate limit" in detail.lower() or "usage limit" in detail.lower():
+                raise RuntimeError(
+                    "Claude subscription usage limit reached. "
+                    "Wait for the 5-hour window to reset, then re-run — "
+                    "completed pipeline artifacts are reused on retry.\n"
+                    f"  CLI said: {detail}"
+                )
+            raise RuntimeError(f"claude CLI failed (exit {proc.returncode}): {detail}")
+
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            raise RuntimeError(
+                f"claude CLI returned non-JSON output: {proc.stdout[:300]}"
+            ) from None
+        if data.get("is_error"):
+            raise RuntimeError(f"claude CLI error: {str(data.get('result', ''))[:500]}")
+
+        usage = data.get("usage", {}) or {}
+        _get_cost_log().append({
+            "agent": _agent or "unknown",
+            "input_tokens": usage.get("input_tokens", 0) or 0,
+            "output_tokens": usage.get("output_tokens", 0) or 0,
+            "cache_read_tokens": usage.get("cache_read_input_tokens", 0) or 0,
+            "cache_write_tokens": usage.get("cache_creation_input_tokens", 0) or 0,
+        })
+        return str(data.get("result", "")).strip()
+
+
 def _get_backend(
     config: "SpeckitConfig",
     prefer_fast: bool = False,
-) -> _AnthropicBackend | _GeminiBackend:
+) -> _AnthropicBackend | _GeminiBackend | _ClaudeCLIBackend:
     """
     Return the best available LLM backend.
 
@@ -371,15 +463,31 @@ def _get_backend(
     is not needed.
 
     Detection order (first match wins):
+      0. SPECKIT_USE_CLAUDE_CLI=true → Claude Code CLI (Pro/Max subscription)
       1. GEMINI_VERTEX=true          → Gemini on Vertex AI
       2. GEMINI_API_KEY              → Gemini via Google AI Studio (free tier)
       3. ANTHROPIC_VERTEX_PROJECT_ID → Claude on Vertex AI
       4. ANTHROPIC_API_KEY           → Anthropic direct API
+      5. claude CLI found on machine → Claude Code CLI (auto-fallback)
     """
-    from google import genai as ggenai  # type: ignore[import]
+    # 0. Claude Code CLI — explicit opt-in (uses Pro/Max subscription, no API key)
+    if os.environ.get("SPECKIT_USE_CLAUDE_CLI", "").lower() in ("true", "1", "yes"):
+        cli = _find_claude_cli()
+        if not cli:
+            raise EnvironmentError(
+                "SPECKIT_USE_CLAUDE_CLI=true but the claude CLI was not found.\n"
+                "  Install it: curl -fsSL https://claude.ai/install.sh | bash\n"
+                "  Then log in once: claude  (uses your Claude Pro/Max subscription)"
+            )
+        model = "haiku" if prefer_fast else (config.agent.model or "sonnet")
+        return _ClaudeCLIBackend(cli, model)
 
     # 1. Gemini on Vertex (reuses GOOGLE_APPLICATION_CREDENTIALS)
     if os.environ.get("GEMINI_VERTEX", "").lower() in ("true", "1", "yes"):
+        try:
+            from google import genai as ggenai  # type: ignore[import]
+        except ImportError:
+            raise RuntimeError("Run: pip install google-genai") from None
         project = (
             os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID", "")
             or os.environ.get("GEMINI_VERTEX_PROJECT_ID", "")
@@ -399,6 +507,10 @@ def _get_backend(
     # 2. Gemini via Google AI Studio (free API key)
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     if gemini_key:
+        try:
+            from google import genai as ggenai  # type: ignore[import]
+        except ImportError:
+            raise RuntimeError("Run: pip install google-genai") from None
         client = ggenai.Client(api_key=gemini_key)
         fast = "gemini-2.0-flash-lite"
         model = fast if prefer_fast else os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
@@ -429,13 +541,22 @@ def _get_backend(
         model = "claude-haiku-4-5-20251001" if prefer_fast else config.agent.model
         return _AnthropicBackend(anthropic.Anthropic(api_key=key), model)
 
+    # 5. Auto-fallback: Claude Code CLI with subscription auth, if installed
+    cli = _find_claude_cli()
+    if cli:
+        model = "haiku" if prefer_fast else (config.agent.model or "sonnet")
+        return _ClaudeCLIBackend(cli, model)
+
     raise EnvironmentError(
         "No LLM credentials found. Add one of these to .env:\n\n"
+        "  Free with a Claude Pro/Max subscription — Claude Code CLI:\n"
+        "    SPECKIT_USE_CLAUDE_CLI=true\n"
+        "    (install CLI: curl -fsSL https://claude.ai/install.sh | bash)\n\n"
+        "  Free — Gemini via Google AI Studio:\n"
+        "    GEMINI_API_KEY=AIza...  (get key at aistudio.google.com)\n\n"
         "  Free — Gemini on your existing Vertex project:\n"
         "    GEMINI_VERTEX=true\n"
         "    ANTHROPIC_VERTEX_PROJECT_ID=sdd-1-495816\n\n"
-        "  Free — Gemini via Google AI Studio:\n"
-        "    GEMINI_API_KEY=AIza...  (get key at aistudio.google.com)\n\n"
         "  Paid — Anthropic direct API:\n"
         "    ANTHROPIC_API_KEY=sk-ant-..."
     )
@@ -477,7 +598,10 @@ def _get_coding_backend(config: "SpeckitConfig") -> _AnthropicBackend | _GeminiB
         return _AnthropicBackend(anthropic.Anthropic(api_key=key), model)
 
     if choice == "gemini":
-        from google import genai as ggenai  # type: ignore[import]
+        try:
+            from google import genai as ggenai  # type: ignore[import]
+        except ImportError:
+            raise RuntimeError("Run: pip install google-genai") from None
         key = os.environ.get("GEMINI_API_KEY", "")
         if key:
             model = coding_model or os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
