@@ -101,17 +101,39 @@ class BugFixPipeline:
         )
         return r.returncode, (r.stdout + r.stderr).strip()
 
-    def _apply_code_changes(self, code_plan) -> list[str]:
-        """Write code changes to disk. Returns list of changed file paths."""
+    def _apply_code_changes(self, code_plan) -> tuple[list[str], list[str]]:
+        """
+        Write code changes to disk after validating each full-file rewrite.
+
+        Returns (changed_files, rejected_changes). A change is rejected — and NOT
+        written — when overwriting an existing file would destroy code the model
+        never saw (truncated input) or when the rewrite is suspiciously short.
+        Rejections abort the PR upstream, so a destructive write is never merged.
+        """
+        from speckit.core.file_safety import validate_rewrite
+
+        truncated = getattr(self, "_truncated_source_files", set())
         changed: list[str] = []
+        rejected: list[str] = []
         for change in code_plan.changes:
             if not change.file or not change.content:
                 continue
             target = self.project_root / change.file
+            if change.action == "modify" and target.exists():
+                try:
+                    original = target.read_text(encoding="utf-8")
+                except OSError:
+                    original = ""
+                ok, reason = validate_rewrite(
+                    original, change.content, change.file in truncated
+                )
+                if not ok:
+                    rejected.append(f"{change.file}: {reason}")
+                    continue
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(change.content, encoding="utf-8")
             changed.append(change.file)
-        return changed
+        return changed, rejected
 
     def _build_code_changes_md(self, code_plan, test_result=None) -> str:
         lines = [f"# Code changes\n\n**Summary:** {code_plan.summary}\n"]
@@ -203,24 +225,55 @@ class BugFixPipeline:
         return results
 
     def _read_source_files(self, spec_results: list[dict]) -> dict[str, str]:
-        """Read source files referenced in spec frontmatter (local or via GitHub)."""
+        """
+        Read source files referenced in spec frontmatter (local or via GitHub).
+
+        Files are read in full up to MAX_SOURCE_FILE_CHARS. Any file that exceeds
+        that cap is recorded in self._truncated_source_files so the code-apply
+        step can refuse to blindly full-file-rewrite a file the model never saw
+        in its entirety.
+        """
+        from speckit.core.file_safety import read_capped
+
+        self._truncated_source_files: set[str] = set()
         source_files: dict[str, str] = {}
         for spec in spec_results:
             for fpath in spec.get("source_files", []):
                 if fpath in source_files:
                     continue
+                raw: str | None = None
                 local = self.project_root / fpath
                 if local.exists():
                     try:
-                        source_files[fpath] = local.read_text(encoding="utf-8")[:2000]
+                        raw = local.read_text(encoding="utf-8")
                     except OSError:
-                        pass
+                        raw = None
                 elif self.github:
                     try:
-                        source_files[fpath] = self.github.get_file_contents(fpath)[:2000]
+                        raw = self.github.get_file_contents(fpath)
                     except Exception:
-                        pass
+                        raw = None
+                if raw is None:
+                    continue
+                rr = read_capped(raw)
+                source_files[fpath] = rr.content
+                if rr.was_truncated:
+                    self._truncated_source_files.add(fpath)
         return source_files
+
+    @staticmethod
+    def _tests_were_vacuous(test_result) -> bool:
+        """
+        Detect a 'green' test run that didn't actually exercise anything.
+
+        A passing exit code means nothing if zero tests were collected. This
+        catches the silent-test-gap failure mode where a fix ships because the
+        suite ran no assertions against it.
+        """
+        if test_result is None:
+            return False
+        from speckit.adapters.shell import output_looks_vacuous
+        return output_looks_vacuous(test_result.stdout + "\n" + test_result.stderr)
 
     def _build_classification_md(self, issue_number: int, c) -> str:
         return (
@@ -429,8 +482,10 @@ class BugFixPipeline:
                 shell = ShellAdapter(cwd=self.project_root)
                 code_plan: Optional[CodePlan] = None
                 test_result = None
+                code_review = None
                 prev_output = ""
 
+                rejected_changes: list[str] = []
                 for attempt in range(1, 4):
                     self._step(
                         f"Writing code fix (attempt {attempt})",
@@ -443,10 +498,26 @@ class BugFixPipeline:
                         config=self.config,
                         project_root=self.project_root,
                         previous_test_output=prev_output,
+                        truncated_files=sorted(getattr(self, "_truncated_source_files", set())),
                     )
                     if not code_plan or not code_plan.changes:
                         raise RuntimeError("write_code() returned an empty plan — no changes to apply")
-                    changed_files = self._apply_code_changes(code_plan)
+                    changed_files, rejected_changes = self._apply_code_changes(code_plan)
+                    if rejected_changes:
+                        self._step(
+                            "Unsafe rewrite(s) rejected — see DESTRUCTIVE_CHANGE_BLOCKED.md",
+                            "; ".join(rejected_changes),
+                        )
+                        self._write(
+                            "DESTRUCTIVE_CHANGE_BLOCKED.md",
+                            "# Destructive change blocked\n\n"
+                            "speckit refused to overwrite the following files because the "
+                            "generated rewrite would have destroyed code the model did not "
+                            "fully see, or was suspiciously short:\n\n"
+                            + "\n".join(f"- {r}" for r in rejected_changes)
+                            + "\n\nNo PR will be opened. Re-run with a smaller scope or fix "
+                            "the affected file manually.",
+                        )
                     self._step(
                         "Code applied",
                         f"{len(changed_files)} file(s): {', '.join(changed_files[:3])}",
@@ -463,6 +534,18 @@ class BugFixPipeline:
 
                     status = "passed" if test_result.passed else "failed"
                     self._step(f"Tests {status}", f"exit code {test_result.return_code}")
+
+                    if test_result.passed and self._tests_were_vacuous(test_result):
+                        self._step(
+                            "Tests passed but collected 0 tests — treating as not verified",
+                            "a green run with no tests does not prove the fix works",
+                        )
+                        test_result.passed = False
+                        prev_output = (
+                            "The test command exited 0 but ran no tests. Add or point to "
+                            "real tests that exercise the changed code, then ensure they pass."
+                        )
+                        continue
 
                     if test_result.passed:
                         break
@@ -538,11 +621,26 @@ class BugFixPipeline:
                             + "\n".join(f"- {s}" for s in secrets_found),
                         )
 
-                # Commit + PR (only if tests passed, no secrets, GitHub connected)
+                # ── PR gate ────────────────────────────────────────────────────
+                # A PR is only opened when EVERY safety gate passes:
+                #   1. tests actually passed (and were not vacuous)
+                #   2. no unsafe/destructive rewrites were rejected
+                #   3. no secrets detected
+                #   4. code review approved (score >= threshold AND no blocking issues)
+                review_approved = code_review.approved if code_review is not None else False
+                pr_blockers: list[str] = []
+                if not (test_result and test_result.passed):
+                    pr_blockers.append("tests did not pass")
+                if rejected_changes:
+                    pr_blockers.append("destructive rewrite(s) blocked")
+                if secrets_found:
+                    pr_blockers.append("secrets detected")
+                if code_review is not None and not review_approved:
+                    pr_blockers.append("code review not approved")
+
                 if (
-                    test_result and test_result.passed
+                    not pr_blockers
                     and self.github and changed_files
-                    and not secrets_found
                 ):
                     self._step("Committing changes")
                     self._git("add", *changed_files)
@@ -553,24 +651,14 @@ class BugFixPipeline:
                     )
                     self._git("push", "-u", "origin", branch_name)
 
-                    code_review_note = ""
-                    if code_plan and (run_dir / "06_code_review.md").exists():
-                        cr = review_generated_code.__module__  # just to confirm import
-                        _cr_txt = (run_dir / "06_code_review.md").read_text(encoding="utf-8")
-                        _approved = "judge-approved" not in _cr_txt and "Approved: False" not in _cr_txt
-                        code_review_note = (
-                            "\n\n⚠️ **Code review flagged issues** — see `06_code_review.md`."
-                            if not code_review.approved else
-                            "\n\n✅ Code review passed."
-                        ) if 'code_review' in dir() else ""
-
                     pr_body = (
                         f"## Summary\n\nFixes #{issue_number}: {issue.title}\n\n"
                         f"{code_plan.summary}\n\n"
                         f"## Changes\n"
                         + "\n".join(f"- `{c.file}`: {c.explanation}" for c in code_plan.changes)
-                        + f"\n\n## Test results\nAll tests passed.{code_review_note}\n\n"
-                        f"---\n*Generated by speckit — review before merging.*"
+                        + "\n\n## Test results\nAll tests passed."
+                        + "\n\n✅ Code review passed."
+                        + "\n\n---\n*Generated by speckit — review before merging.*"
                     )
                     pr = self.github.create_pr(
                         title=f"fix(#{issue_number}): {issue.title}",
@@ -586,6 +674,25 @@ class BugFixPipeline:
                         pr_url=result.pr_url,
                         score=judge_result.final_score,
                     )
+
+                elif pr_blockers and self.github and changed_files:
+                    # Safety gate failed — commit to the branch for human review,
+                    # but do NOT open a PR. Surface why on the issue.
+                    self._step("PR blocked by safety gate", "; ".join(pr_blockers))
+                    self._git("add", *changed_files)
+                    self._git(
+                        "commit", "-m",
+                        f"wip(#{issue_number}): {code_plan.summary} [needs human review]",
+                    )
+                    try:
+                        self.github.add_comment(
+                            issue_number,
+                            f"⚠️ speckit generated a fix on branch `{branch_name}` but did "
+                            f"**not** open a PR because: {', '.join(pr_blockers)}. "
+                            "Review the branch and the run artifacts before merging.",
+                        )
+                    except Exception:
+                        pass
 
                 elif changed_files:
                     # No GitHub — just commit locally

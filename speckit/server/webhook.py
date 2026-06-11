@@ -75,20 +75,22 @@ def _run_pipeline_in_background(
 ) -> None:
     """Spawn pipeline in a daemon thread so the webhook returns immediately."""
     def _worker():
+        github = None
+        config = None
         try:
             from dotenv import load_dotenv
             load_dotenv(project_root / ".env", override=False)
             from speckit.core.config import load_config
             config = load_config(project_root)
 
-            if pipeline_type == "bug_fix":
-                from speckit.adapters.github import GitHubAdapter
-                from speckit.modes.bug_fix import BugFixPipeline
+            from speckit.adapters.github import GitHubAdapter
+            github = GitHubAdapter(
+                repo=os.environ.get("GITHUB_REPO", "") or config.repo,
+                token=os.environ.get("GITHUB_TOKEN", ""),
+            )
 
-                github = GitHubAdapter(
-                    repo=os.environ.get("GITHUB_REPO", "") or config.repo,
-                    token=os.environ.get("GITHUB_TOKEN", ""),
-                )
+            if pipeline_type == "bug_fix":
+                from speckit.modes.bug_fix import BugFixPipeline
                 pipeline = BugFixPipeline(config=config, project_root=project_root, github=github)
                 pipeline.run(issue_number=issue_number)
 
@@ -100,8 +102,19 @@ def _run_pipeline_in_background(
                     feature_description=extra_kwargs.get("description", ""),
                 )
 
-        except Exception:
+        except Exception as e:
             logger.exception("Pipeline failed for issue #%s", issue_number)
+            # Surface the failure on the issue so it is never silently dropped.
+            if github is not None:
+                try:
+                    github.add_comment(
+                        issue_number,
+                        f"❌ speckit {pipeline_type} pipeline failed for this issue:\n\n"
+                        f"```\n{type(e).__name__}: {e}\n```\n\n"
+                        "No PR was opened. Check the speckit server logs for the full trace.",
+                    )
+                except Exception:
+                    logger.exception("Could not post failure comment to issue #%s", issue_number)
 
     t = threading.Thread(target=_worker, daemon=True)
     t.start()

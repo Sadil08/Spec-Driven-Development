@@ -979,9 +979,11 @@ def write_code(
     project_root: Path,
     previous_test_output: str = "",
     mode: str = "fix",  # "fix" | "feature"
+    truncated_files: list[str] | None = None,
 ) -> CodePlan:
     """~4 000 input / ~3 000 output tokens."""
     backend = _get_coding_backend(config)
+    truncated_files = truncated_files or []
 
     _mode_instructions = {
         "fix": (
@@ -996,11 +998,24 @@ def write_code(
             "- Implement security requirements (auth, validation, rate limiting) from NFR section."
         ),
     }
+    _truncation_rule = ""
+    if truncated_files:
+        _truncation_rule = (
+            "\n- WARNING: these files were too large to include in full and you are "
+            f"seeing only the beginning: {', '.join(truncated_files)}. "
+            "You MUST NOT return a full-file rewrite for them — you would delete the "
+            "code you cannot see. If your change requires editing one of these files, "
+            "instead return changes ONLY to smaller files, or set the change for the "
+            "large file aside and explain in 'summary' that it needs manual editing."
+        )
+
     system = _prompt_override("write_code", project_root) or f"""
 You are a senior software engineer implementing a {mode if mode == "feature" else "bug fix"}.
 RULES:
 - {_mode_instructions.get(mode, _mode_instructions["fix"])}
 - Output FULL file contents for every modified file — not diffs or snippets.
+- Preserve ALL existing code, imports, functions, and comments that are not directly
+  part of your change. Never drop unrelated code from a file you rewrite.{_truncation_rule}
 - Return JSON only — no markdown, no explanation outside the JSON.
 """
 
