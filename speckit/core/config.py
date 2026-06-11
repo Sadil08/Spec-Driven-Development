@@ -30,6 +30,37 @@ class TestingConfig(BaseModel):
     frontend_runner: str = "vitest"
     api_test_tool: str = "curl"
     coverage_threshold: int = 80
+    # ── sandboxed execution ──────────────────────────────────────────────────
+    # When true, test commands run inside a network-isolated Docker container so
+    # generated code cannot touch the host or the network during test runs.
+    sandbox: bool = False
+    sandbox_image: str = "python:3.12-slim"
+
+
+class PolicyConfig(BaseModel):
+    """
+    Guardrails on what an autonomous run may change without human review.
+
+    When a category is blocked and a generated change touches it, the PR is held
+    for a human instead of being opened automatically.
+    """
+    block_schema_changes: bool = True          # DB migrations / DDL
+    block_dependency_changes: bool = True       # requirements.txt, package.json, go.mod, ...
+    block_api_signature_changes: bool = True    # public route/handler signature edits
+    block_infra_changes: bool = True            # Dockerfile, *.tf, k8s, CI workflows
+    block_file_deletions: bool = True
+
+
+class DeployConfig(BaseModel):
+    """
+    Optional deploy → health-check → auto-revert loop. Disabled by default; touches
+    production so it is strictly opt-in.
+    """
+    auto_deploy: bool = False
+    deploy_command: str = ""        # e.g. "make deploy" — allowlisted executable
+    health_check_url: str = ""      # polled after deploy; non-2xx => unhealthy
+    health_check_timeout: int = 120  # seconds to wait for healthy
+    rollback_command: str = ""      # run if health check fails
 
 
 class AgentConfig(BaseModel):
@@ -100,6 +131,8 @@ class SpeckitConfig(BaseModel):
     github: GitHubConfig = Field(default_factory=GitHubConfig)
     testing: TestingConfig = Field(default_factory=TestingConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
+    policy: PolicyConfig = Field(default_factory=PolicyConfig)
+    deploy: DeployConfig = Field(default_factory=DeployConfig)
 
     @field_validator("repo")
     @classmethod

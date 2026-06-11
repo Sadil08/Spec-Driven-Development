@@ -50,6 +50,33 @@ def _extract_labels(issue_data: dict) -> list[str]:
     return [lb["name"] for lb in issue_data.get("labels", [])]
 
 
+def _csv_env(name: str) -> set[str]:
+    """Parse a comma-separated env var into a lowercased set (empty = unset)."""
+    raw = os.environ.get(name, "")
+    return {x.strip().lower() for x in raw.split(",") if x.strip()}
+
+
+def _is_authorized(repo_full_name: str, actor: str) -> tuple[bool, str]:
+    """
+    Authorize a webhook trigger against optional allowlists.
+
+    SPECKIT_ALLOWED_REPOS  — comma-separated org/repo names permitted to trigger runs.
+    SPECKIT_ALLOWED_ACTORS — comma-separated GitHub usernames permitted to trigger runs.
+
+    An unset allowlist means "allow all" (backwards compatible). When set, the
+    request must match or it is rejected — this stops an arbitrary outsider's issue
+    from launching an autonomous code-writing run.
+    """
+    allowed_repos = _csv_env("SPECKIT_ALLOWED_REPOS")
+    allowed_actors = _csv_env("SPECKIT_ALLOWED_ACTORS")
+
+    if allowed_repos and repo_full_name.lower() not in allowed_repos:
+        return False, f"repo {repo_full_name!r} not in SPECKIT_ALLOWED_REPOS"
+    if allowed_actors and actor.lower() not in allowed_actors:
+        return False, f"actor {actor!r} not in SPECKIT_ALLOWED_ACTORS"
+    return True, ""
+
+
 def _load_project_map() -> dict[str, Path]:
     """
     Load SPECKIT_PROJECT_MAP from env.
@@ -188,6 +215,18 @@ def create_app(project_root: Path):
 
         # ── Resolve project root (multi-project support) ───────────────────────
         repo_full_name: str = payload.get("repository", {}).get("full_name", "")
+
+        # ── Authorization: only allowlisted repos/actors may trigger runs ──────
+        actor = payload.get("sender", {}).get("login", "")
+        authorized, why = _is_authorized(repo_full_name, actor)
+        if not authorized:
+            logger.warning("Rejecting unauthorized webhook: %s", why)
+            return Response(
+                content=json.dumps({"ignored": True, "reason": f"unauthorized: {why}"}),
+                media_type="application/json",
+                status_code=403,
+            )
+
         resolved_root = project_map.get(repo_full_name, project_root)
         if repo_full_name and repo_full_name not in project_map and project_map:
             logger.warning(

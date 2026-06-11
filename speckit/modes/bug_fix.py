@@ -415,6 +415,10 @@ class BugFixPipeline:
         run_dir.mkdir(parents=True, exist_ok=True)
         self._run_dir = run_dir
 
+        from speckit.core.audit import AuditLog
+        self.audit = AuditLog(run_dir, "bug-fix", f"#{issue_number}")
+        self.audit.record("run_started", issue=issue_number)
+
         self._step(f"Starting pipeline", f"issue #{issue_number}")
 
         result = RunResult(
@@ -603,7 +607,11 @@ class BugFixPipeline:
                 self._step("Branch created", branch_name)
 
                 # Retry loop: write code → run tests (up to 3 attempts)
-                shell = ShellAdapter(cwd=self.project_root)
+                shell = ShellAdapter(
+                    cwd=self.project_root,
+                    sandbox=self.config.testing.sandbox,
+                    sandbox_image=self.config.testing.sandbox_image,
+                )
                 code_plan: Optional[CodePlan] = None
                 test_result = None
                 code_review = None
@@ -773,10 +781,20 @@ class BugFixPipeline:
                             + "\n".join(f"- {s}" for s in secrets_found),
                         )
 
-                # ── Blast-radius check ─────────────────────────────────────────
+                # ── Blast-radius + policy checks ───────────────────────────────
                 from speckit.core.limits import check_blast_radius
+                from speckit.core.policy import evaluate_policy
                 blast_violations = (
                     check_blast_radius(code_plan.changes, self.config) if code_plan else []
+                )
+
+                def _orig(path: str) -> str:
+                    p = self.project_root / path
+                    return p.read_text(encoding="utf-8") if p.exists() else ""
+
+                policy_violations = (
+                    evaluate_policy(code_plan.changes, self.config, read_original=_orig)
+                    if code_plan else []
                 )
 
                 # ── PR gate ────────────────────────────────────────────────────
@@ -786,6 +804,7 @@ class BugFixPipeline:
                 #   3. no secrets detected
                 #   4. code review approved (score >= threshold AND no blocking issues)
                 #   5. change is within the blast-radius budget
+                #   6. change does not touch a policy-protected category
                 review_approved = code_review.approved if code_review is not None else False
                 pr_blockers: list[str] = []
                 if not (test_result and test_result.passed):
@@ -798,6 +817,17 @@ class BugFixPipeline:
                     pr_blockers.append("code review not approved")
                 if blast_violations:
                     pr_blockers.append("change too large: " + "; ".join(blast_violations))
+                if policy_violations:
+                    pr_blockers.append("policy: " + "; ".join(policy_violations))
+
+                self.audit.gate("tests_passed", bool(test_result and test_result.passed))
+                self.audit.gate("no_destructive_rewrites", not rejected_changes)
+                self.audit.gate("no_secrets", not secrets_found)
+                self.audit.gate("code_review_approved", review_approved)
+                self.audit.gate("within_blast_radius", not blast_violations,
+                                violations=blast_violations)
+                self.audit.gate("policy_clear", not policy_violations,
+                                violations=policy_violations)
 
                 if (
                     not pr_blockers
@@ -829,6 +859,7 @@ class BugFixPipeline:
                     )
                     result.pr_url = pr.get("html_url", "")
                     self._step("PR opened", result.pr_url)
+                    self.audit.decision("pr", "opened", url=result.pr_url)
                     slack.pr_opened(
                         issue_number=issue_number,
                         title=issue.title,
@@ -836,10 +867,35 @@ class BugFixPipeline:
                         score=judge_result.final_score,
                     )
 
+                    # ── Optional deploy → health-check → auto-revert ──────────
+                    if self.config.deploy.auto_deploy:
+                        self._step("Deploying", self.config.deploy.deploy_command)
+                        from speckit.core.deploy import run_deploy
+                        dep = run_deploy(self.config, self.project_root)
+                        self.audit.decision(
+                            "deploy",
+                            "healthy" if dep.healthy else ("rolled_back" if dep.rolled_back else "failed"),
+                            detail=dep.detail,
+                        )
+                        self._step(
+                            "Deploy result",
+                            f"deployed={dep.deployed} healthy={dep.healthy} "
+                            f"rolled_back={dep.rolled_back} — {dep.detail}",
+                        )
+                        if not dep.healthy:
+                            try:
+                                self.github.add_comment(
+                                    issue_number,
+                                    f"⚠️ Auto-deploy did not reach a healthy state: {dep.detail}",
+                                )
+                            except Exception:
+                                pass
+
                 elif pr_blockers and self.github and changed_files:
                     # Safety gate failed — commit to the branch for human review,
                     # but do NOT open a PR. Surface why on the issue.
                     self._step("PR blocked by safety gate", "; ".join(pr_blockers))
+                    self.audit.decision("pr", "held_for_review", blockers=pr_blockers)
                     self._git("add", *changed_files)
                     self._git(
                         "commit", "-m",

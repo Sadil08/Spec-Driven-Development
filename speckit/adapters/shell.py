@@ -108,11 +108,38 @@ def _validate_and_tokenize(command: str) -> list[str]:
 
 
 class ShellAdapter:
-    """Run test commands in a controlled subprocess (no shell, allowlisted)."""
+    """Run test commands in a controlled subprocess (no shell, allowlisted).
 
-    def __init__(self, cwd: Path, timeout: int = _DEFAULT_TIMEOUT):
+    When sandbox=True, the validated command is executed inside a network-isolated
+    Docker container with the project mounted read-write at /work, so generated code
+    cannot reach the host filesystem or the network during a test run.
+    """
+
+    def __init__(
+        self,
+        cwd: Path,
+        timeout: int = _DEFAULT_TIMEOUT,
+        sandbox: bool = False,
+        sandbox_image: str = "python:3.12-slim",
+    ):
         self.cwd = cwd
         self.timeout = timeout
+        self.sandbox = sandbox
+        self.sandbox_image = sandbox_image
+
+    def _build_argv(self, tokens: list[str]) -> list[str]:
+        """Wrap the validated tokens in a docker invocation when sandboxing."""
+        if not self.sandbox:
+            return tokens
+        return [
+            "docker", "run", "--rm",
+            "--network", "none",          # no network egress from generated code
+            "--cpus", "2", "--memory", "2g",
+            "-v", f"{self.cwd}:/work",
+            "-w", "/work",
+            self.sandbox_image,
+            *tokens,
+        ]
 
     def run_tests(self, command: str) -> TestResult:
         """
@@ -122,10 +149,11 @@ class ShellAdapter:
         the safety policy — preventing arbitrary command execution.
         """
         tokens = _validate_and_tokenize(command)
+        argv = self._build_argv(tokens)
 
         try:
             proc = subprocess.run(
-                tokens,
+                argv,
                 shell=False,
                 cwd=self.cwd,
                 capture_output=True,
@@ -141,12 +169,17 @@ class ShellAdapter:
                 stderr=f"Command timed out after {self.timeout}s",
             )
         except FileNotFoundError:
+            missing = argv[0]
+            hint = (
+                " (sandbox enabled but Docker is not installed/available)"
+                if self.sandbox and missing == "docker" else ""
+            )
             return TestResult(
                 passed=False,
                 command=command,
                 return_code=-1,
                 stdout="",
-                stderr=f"Executable not found: {tokens[0]}",
+                stderr=f"Executable not found: {missing}{hint}",
             )
 
         return TestResult(
@@ -161,6 +194,28 @@ class ShellAdapter:
         """Convenience wrapper returning (passed, combined_output)."""
         result = self.run_tests(command)
         return result.passed, result.summary()
+
+    def run_trusted(self, command: str) -> tuple[bool, str]:
+        """
+        Run an OPERATOR-CONFIGURED command (e.g. a deploy/rollback command from
+        the trusted config file). This intentionally allows shell features because
+        its source is the operator, at the same trust level as the config itself.
+
+        NEVER pass LLM-generated text here — use run()/run_tests() for that.
+        """
+        try:
+            proc = subprocess.run(
+                command,
+                shell=True,
+                cwd=self.cwd,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return False, f"Command timed out after {self.timeout}s"
+        output = (proc.stdout + "\n" + proc.stderr).strip()
+        return proc.returncode == 0, output
 
 
 # Backwards-compatible alias used by the orchestrator pipeline.
