@@ -14,6 +14,7 @@ from speckit.commands.serve import serve_command
 from speckit.commands.mcp import mcp_command
 from speckit.commands.orchestrate import orchestrate_command
 from speckit.commands.orchestrate_bug import orchestrate_bug_command
+from speckit.commands.brownfield_init import brownfield_init_command
 
 app = typer.Typer(
     name="speckit",
@@ -33,6 +34,10 @@ app.command("serve", help="Start the GitHub webhook server.")(serve_command)
 app.command("mcp", help="Start the MCP server for Claude Pro integration.")(mcp_command)
 app.command("orchestrate", help="Run a cross-service feature pipeline.")(orchestrate_command)
 app.command("orchestrate-bug", help="Run a cross-service bug-fix pipeline.")(orchestrate_bug_command)
+app.command(
+    "brownfield-init",
+    help="Bootstrap speckit for an existing multi-service codebase (no specs yet).",
+)(brownfield_init_command)
 
 
 def main():

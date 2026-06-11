@@ -2584,3 +2584,314 @@ def scan_for_secrets(code_changes: list) -> list[str]:
                 findings.append(f"{label} in {file_path}: `{snippet}...`")
 
     return findings
+
+
+# ── Agent 29: audit_security ───────────────────────────────────────────────────
+
+class SecurityFinding(BaseModel):
+    category: str       # injection / auth / crypto / exposure / config / ssrf / idor / other
+    severity: str       # critical / high / medium / low
+    location: str       # filename or filename:line hint
+    description: str
+    remediation: str
+
+
+class SecurityAuditResult(BaseModel):
+    overall_score: float   # 0.0 = critical risk → 1.0 = secure
+    risk_level: str        # critical / high / medium / low
+    findings: list[SecurityFinding]
+    summary: str
+
+
+def audit_security(
+    service_name: str,
+    code_files: dict[str, str],    # {relative_path: content}
+    architecture_spec: str,
+    config: "SpeckitConfig",
+    project_root: Path,
+) -> SecurityAuditResult:
+    """
+    Agent 29 — OWASP-based security audit of existing service code.
+
+    Reviews provided source files for: injection flaws, broken auth, sensitive data
+    exposure, security misconfiguration, SSRF, IDOR, hardcoded credentials, insecure
+    crypto, missing rate-limiting, and insufficient logging.
+    """
+    override = _prompt_override("audit_security", project_root)
+
+    files_block = "\n\n".join(
+        f"### {path}\n```\n{content[:1200]}\n```"
+        for path, content in list(code_files.items())[:12]
+    )
+
+    system = override or (
+        "You are a senior application security engineer performing an OWASP Top-10 "
+        "focused code review on an existing service codebase. Your job is to identify "
+        "real, exploitable vulnerabilities — not theoretical ones. Be specific about "
+        "file locations. Score 0.0 = critical (multiple high/critical findings), "
+        "1.0 = fully secure (no meaningful findings)."
+    )
+
+    user = f"""## Service: {service_name}
+
+## Architecture
+{architecture_spec[:1500] if architecture_spec else "(not available)"}
+
+## Source files
+{files_block}
+
+## Task
+Review the source files above for security vulnerabilities. Cover at minimum:
+- Injection (SQL, command, template, LDAP)
+- Broken authentication / session management
+- Sensitive data exposure (credentials in code, unencrypted PII)
+- Security misconfiguration (debug modes, open CORS, missing headers)
+- SSRF / IDOR / path traversal
+- Missing input validation
+- Insecure crypto (MD5/SHA1 for passwords, hardcoded salts)
+- Missing rate-limiting on sensitive endpoints
+- Insufficient error handling (stack traces exposed)
+
+Return ONLY valid JSON in this exact shape:
+{{
+  "overall_score": 0.0–1.0,
+  "risk_level": "critical|high|medium|low",
+  "summary": "one-paragraph executive summary",
+  "findings": [
+    {{
+      "category": "injection|auth|crypto|exposure|config|ssrf|idor|other",
+      "severity": "critical|high|medium|low",
+      "location": "filename or filename:approx-line",
+      "description": "what is wrong and why it is exploitable",
+      "remediation": "specific fix with code hint where possible"
+    }}
+  ]
+}}"""
+
+    backend = _get_backend(config, prefer_fast=False)
+    raw = backend.call(system=system, user=user, max_tokens=2500, _agent="audit_security")
+    data = _parse_json_safe(raw)
+    return SecurityAuditResult(**data)
+
+
+# ── Agent 30: audit_scalability ────────────────────────────────────────────────
+
+class ScalabilityConcern(BaseModel):
+    category: str   # db / caching / concurrency / connection / queue / stateful / memory / coupling
+    severity: str   # critical / high / medium / low
+    location: str
+    description: str
+    remediation: str
+
+
+class ScalabilityAuditResult(BaseModel):
+    overall_score: float   # 0.0 = severe bottlenecks → 1.0 = well-scaled
+    concerns: list[ScalabilityConcern]
+    summary: str
+
+
+def audit_scalability(
+    service_name: str,
+    code_files: dict[str, str],
+    architecture_spec: str,
+    config: "SpeckitConfig",
+    project_root: Path,
+) -> ScalabilityAuditResult:
+    """
+    Agent 30 — Scalability anti-pattern audit of existing service code.
+
+    Detects: N+1 queries, missing indexes, no connection pooling, synchronous blocking
+    calls in async paths, in-process session state, missing caching layers, unbounded
+    memory growth, tight coupling, missing circuit breakers/retries.
+    """
+    override = _prompt_override("audit_scalability", project_root)
+
+    files_block = "\n\n".join(
+        f"### {path}\n```\n{content[:1200]}\n```"
+        for path, content in list(code_files.items())[:12]
+    )
+
+    system = override or (
+        "You are a senior backend engineer specialising in performance and scalability. "
+        "Review the provided service code for scalability bottlenecks and anti-patterns "
+        "that will cause problems under production load. Focus on concrete, observable "
+        "problems — not hypothetical ones. Score 0.0 = severe bottlenecks present, "
+        "1.0 = well-architected for scale."
+    )
+
+    user = f"""## Service: {service_name}
+
+## Architecture
+{architecture_spec[:1500] if architecture_spec else "(not available)"}
+
+## Source files
+{files_block}
+
+## Task
+Identify scalability anti-patterns. Check for:
+- N+1 query problems (loops that trigger DB queries)
+- Missing database connection pooling
+- Synchronous blocking I/O in async request paths
+- In-memory session / user state (prevents horizontal scaling)
+- Missing caching for expensive or repeated operations
+- Unbounded result sets (SELECT * with no LIMIT)
+- Missing retry/backoff/circuit-breaker for external calls
+- Tight synchronous coupling between services (should be async/event-driven)
+- Missing pagination on list endpoints
+- Shared mutable global state
+- File system state that prevents multi-instance deployment
+
+Return ONLY valid JSON:
+{{
+  "overall_score": 0.0–1.0,
+  "summary": "one-paragraph assessment",
+  "concerns": [
+    {{
+      "category": "db|caching|concurrency|connection|queue|stateful|memory|coupling",
+      "severity": "critical|high|medium|low",
+      "location": "filename or module name",
+      "description": "what the problem is and its impact at scale",
+      "remediation": "specific fix recommendation"
+    }}
+  ]
+}}"""
+
+    backend = _get_backend(config, prefer_fast=False)
+    raw = backend.call(system=system, user=user, max_tokens=2000, _agent="audit_scalability")
+    data = _parse_json_safe(raw)
+    return ScalabilityAuditResult(**data)
+
+
+# ── Agent 31: extract_service_contracts ───────────────────────────────────────
+
+def extract_service_contracts(
+    service_name: str,
+    code_files: dict[str, str],    # route/handler/API files
+    config: "SpeckitConfig",
+    project_root: Path,
+) -> str:
+    """
+    Agent 31 — Extract inter-service API contracts from existing route/handler code.
+
+    Returns a markdown contract spec listing all HTTP endpoints, their request/response
+    schemas, auth requirements, and any events published or consumed.
+    """
+    override = _prompt_override("extract_service_contracts", project_root)
+
+    files_block = "\n\n".join(
+        f"### {path}\n```\n{content[:1500]}\n```"
+        for path, content in list(code_files.items())[:10]
+    )
+
+    system = override or (
+        "You are a senior backend engineer writing API contract documentation. "
+        "Extract every HTTP endpoint, request/response schema, auth requirement, "
+        "and async event from the provided source files. Be precise — only document "
+        "what you actually see in the code, not what you assume might exist."
+    )
+
+    user = f"""## Service: {service_name}
+
+## Route/handler files
+{files_block}
+
+## Task
+Extract the complete API contract for this service. Produce a markdown document with:
+
+1. **Service summary** — one paragraph describing what this service does
+2. **HTTP endpoints** — for each endpoint:
+   - Method + path (e.g. `POST /api/v1/users`)
+   - Authentication required (none / bearer / api-key / session)
+   - Request body schema (fields, types, required/optional)
+   - Success response schema (status code, fields)
+   - Error responses (status codes + conditions)
+3. **Events published** (if any async events are produced)
+4. **Events consumed** (if any async events are handled)
+5. **External dependencies** — other services or third-party APIs called
+
+Format as clean, readable markdown. Be specific to what you see in the code.
+If the code is unclear or incomplete, note it explicitly rather than guessing."""
+
+    backend = _get_backend(config, prefer_fast=False)
+    return backend.call(system=system, user=user, max_tokens=2500, _agent="extract_service_contracts")
+
+
+# ── Agent 32: detect_ambiguities ──────────────────────────────────────────────
+
+class Ambiguity(BaseModel):
+    category: str    # ownership / coupling / naming / data-flow / error-handling / config / security
+    severity: str    # high / medium / low
+    description: str
+    locations: list[str]
+    recommendation: str
+
+
+class AmbiguityReport(BaseModel):
+    ambiguities: list[Ambiguity]
+    summary: str
+
+
+def detect_ambiguities(
+    service_name: str,
+    architecture_spec: str,
+    module_specs_summary: str,
+    sample_code: str,
+    config: "SpeckitConfig",
+    project_root: Path,
+) -> AmbiguityReport:
+    """
+    Agent 32 — Detect architectural ambiguities, inconsistencies, and tech-debt signals.
+
+    Reads architecture spec + module summaries + code samples and flags: unclear ownership,
+    implicit coupling, naming inconsistencies, undocumented data flows, missing error
+    strategies, config sprawl, and security policy gaps.
+    """
+    override = _prompt_override("detect_ambiguities", project_root)
+
+    system = override or (
+        "You are a software architect reviewing an existing service for structural ambiguities "
+        "and inconsistencies that would slow down a new engineer or cause bugs when adding "
+        "features. Focus on concrete, actionable findings — not style preferences."
+    )
+
+    user = f"""## Service: {service_name}
+
+## Architecture spec
+{architecture_spec[:2000] if architecture_spec else "(not available)"}
+
+## Module specs summary
+{module_specs_summary[:1500] if module_specs_summary else "(not available)"}
+
+## Code sample
+{sample_code[:1500] if sample_code else "(not available)"}
+
+## Task
+Identify architectural ambiguities and inconsistencies. Look for:
+- Unclear module ownership (who owns this data / this decision?)
+- Implicit coupling (module A secretly depends on module B's internals)
+- Naming inconsistencies (same concept called different things in different places)
+- Undocumented or unclear data flows (where does this data come from/go to?)
+- Missing error handling strategy (what happens when X fails?)
+- Configuration sprawl (settings scattered in multiple places)
+- Security policy gaps (who can call this? what's the authorization model?)
+- Dead code or zombie modules referenced but apparently unused
+- Mixed abstraction levels in the same module
+
+Return ONLY valid JSON:
+{{
+  "summary": "two-sentence overall assessment",
+  "ambiguities": [
+    {{
+      "category": "ownership|coupling|naming|data-flow|error-handling|config|security",
+      "severity": "high|medium|low",
+      "description": "what is ambiguous and why it matters",
+      "locations": ["module or file names where this appears"],
+      "recommendation": "how to resolve this"
+    }}
+  ]
+}}"""
+
+    backend = _get_backend(config, prefer_fast=False)
+    raw = backend.call(system=system, user=user, max_tokens=1800, _agent="detect_ambiguities")
+    data = _parse_json_safe(raw)
+    return AmbiguityReport(**data)
