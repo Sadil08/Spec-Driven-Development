@@ -178,6 +178,7 @@ class OrchestratorPipeline(_PipelineBase):
             clear_pipeline_cache,
             review_generated_code,
             scan_for_secrets,
+            verify_nfr_implementation,
         )
         from speckit.core.global_config import topological_sort, save_global_config
         from speckit.modes.feature import FeaturePipeline
@@ -488,7 +489,9 @@ class OrchestratorPipeline(_PipelineBase):
 
                     code_plan = None
                     svc_rejected: list[str] = []
+                    from speckit.core.limits import check_cost_budget, check_blast_radius
                     for attempt in range(1, 4):
+                        check_cost_budget(svc.config)
                         code_plan = write_code(
                             bug_report_md=spec_md,
                             source_file_contents=source_files,
@@ -575,6 +578,32 @@ class OrchestratorPipeline(_PipelineBase):
                             + "\n".join(f"- {i}" for i in code_review.blocking_issues),
                         )
 
+                    # ── NFR-in-code verification ──────────────────────────────
+                    self._step(f"  [{svc.name}] Verifying NFRs are implemented in code")
+                    nfr = verify_nfr_implementation(
+                        spec_md=spec_md,
+                        code_changes=[
+                            {"file": c.file, "action": c.action, "content": c.content}
+                            for c in code_plan.changes
+                        ],
+                        config=svc.config,
+                        project_root=svc.path,
+                    )
+                    if nfr.missing:
+                        self._write(
+                            f"services/{svc.name}_nfr_verification.md",
+                            f"# NFR verification: {svc.name}\n\n{nfr.summary}\n\n"
+                            "## Missing requirements\n"
+                            + "\n".join(f"- {m}" for m in nfr.missing)
+                            + ("\n\n## Safety-critical missing (blocks PR)\n"
+                               + "\n".join(f"- {m}" for m in nfr.blocking_missing)
+                               if nfr.blocking_missing else ""),
+                        )
+                        self._step(
+                            f"  [{svc.name}] NFRs missing from code",
+                            f"{len(nfr.missing)} missing, {len(nfr.blocking_missing)} critical",
+                        )
+
                     # ── Secrets scan ──────────────────────────────────────────
                     secrets_found = scan_for_secrets(code_plan.changes)
 
@@ -587,6 +616,13 @@ class OrchestratorPipeline(_PipelineBase):
                         svc_blockers.append("secrets detected")
                     if not code_review.approved:
                         svc_blockers.append("code review not approved")
+                    if nfr.blocking_missing:
+                        svc_blockers.append(
+                            f"safety-critical NFRs not implemented: {', '.join(nfr.blocking_missing)}"
+                        )
+                    blast_violations = check_blast_radius(code_plan.changes, svc.config)
+                    if blast_violations:
+                        svc_blockers.append("change too large: " + "; ".join(blast_violations))
                     if not result.services_built.get(svc.name):
                         svc_blockers.append("tests did not pass")
                     if svc_blockers:

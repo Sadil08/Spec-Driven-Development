@@ -43,6 +43,19 @@ class AgentConfig(BaseModel):
     coding_backend: str = "auto"
     coding_model: str = ""   # overrides model for code-writing step only
 
+    # ── per-run safety budgets (0 / 0.0 = disabled) ──────────────────────────
+    # Cost ceiling: pipeline aborts before the next expensive agent call once
+    # exceeded, so a runaway loop cannot silently rack up a large bill.
+    max_run_cost_usd: float = Field(default=5.0, ge=0.0)
+    max_run_tokens: int = Field(default=0, ge=0)
+    # Blast radius: a single autonomous change touching more than this many files
+    # or lines is held for human review rather than auto-PR'd.
+    max_changed_files: int = Field(default=25, ge=0)
+    max_changed_lines: int = Field(default=1500, ge=0)
+    # Auto-revert the working tree if a run fails after writing code (only when
+    # the tree was clean at the start, so pre-existing edits are never destroyed).
+    rollback_on_failure: bool = True
+
 
 class VectorDBConfig(BaseModel):
     provider: VectorDBProvider = VectorDBProvider.NONE

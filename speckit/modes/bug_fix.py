@@ -113,13 +113,20 @@ class BugFixPipeline:
         from speckit.core.file_safety import validate_rewrite
 
         truncated = getattr(self, "_truncated_source_files", set())
+        # Track what we touched so a failed run can be rolled back precisely.
+        if not hasattr(self, "_created_files"):
+            self._created_files: set[str] = set()
+        if not hasattr(self, "_modified_files"):
+            self._modified_files: set[str] = set()
+
         changed: list[str] = []
         rejected: list[str] = []
         for change in code_plan.changes:
             if not change.file or not change.content:
                 continue
             target = self.project_root / change.file
-            if change.action == "modify" and target.exists():
+            pre_existing = target.exists()
+            if change.action == "modify" and pre_existing:
                 try:
                     original = target.read_text(encoding="utf-8")
                 except OSError:
@@ -133,7 +140,42 @@ class BugFixPipeline:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(change.content, encoding="utf-8")
             changed.append(change.file)
+            if pre_existing:
+                self._modified_files.add(change.file)
+            else:
+                self._created_files.add(change.file)
         return changed, rejected
+
+    def _snapshot_tree(self) -> None:
+        """Record whether the working tree was clean before we wrote any code."""
+        rc, out = self._git("status", "--porcelain")
+        self._tree_was_clean = (rc == 0 and not out.strip())
+        self._created_files = set()
+        self._modified_files = set()
+
+    def _rollback_tree(self) -> bool:
+        """
+        Revert exactly the files this run wrote, restoring the repo to its
+        pre-run state. Only runs when the tree was clean at the start, so a
+        user's pre-existing uncommitted edits are never destroyed. Returns True
+        if a rollback was performed.
+        """
+        if not getattr(self.config.agent, "rollback_on_failure", True):
+            return False
+        if not getattr(self, "_tree_was_clean", False):
+            return False
+        created = getattr(self, "_created_files", set())
+        modified = getattr(self, "_modified_files", set())
+        if not created and not modified:
+            return False
+        for rel in modified:
+            self._git("checkout", "HEAD", "--", rel)
+        for rel in created:
+            try:
+                (self.project_root / rel).unlink()
+            except OSError:
+                pass
+        return True
 
     def _build_code_changes_md(self, code_plan, test_result=None) -> str:
         lines = [f"# Code changes\n\n**Summary:** {code_plan.summary}\n"]
@@ -275,6 +317,65 @@ class BugFixPipeline:
         from speckit.adapters.shell import output_looks_vacuous
         return output_looks_vacuous(test_result.stdout + "\n" + test_result.stderr)
 
+    _GREP_EXTS = {".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".rb", ".rs", ".cs"}
+    _GREP_SKIP = {
+        "node_modules", "__pycache__", ".git", ".venv", "venv", "dist", "build",
+        ".next", "target", "vendor", "specs", "runs", ".speckit",
+    }
+
+    def _grep_source_files(self, classification, limit: int = 6) -> dict[str, str]:
+        """
+        Fallback source-file discovery when the spec index points at nothing useful.
+
+        Ranks repo files by how many of the classification's search keywords and
+        affected-module names they match (filename match weighted higher), reads the
+        top `limit` in full (capped), and records truncation. This stops the pipeline
+        from inventing a fix against a file it never read when specs are stale.
+        """
+        from speckit.core.file_safety import read_capped
+
+        terms = [t.lower() for t in (
+            list(classification.search_keywords) + list(classification.affected_modules)
+        ) if t and len(t) >= 3]
+        if not terms:
+            return {}
+        modules = {m.lower() for m in classification.affected_modules if m}
+
+        src_root = self.project_root / self.config.paths.src.lstrip("./")
+        search_root = src_root if src_root.exists() else self.project_root
+
+        scored: list[tuple[int, Path]] = []
+        for p in search_root.rglob("*"):
+            if not p.is_file() or p.suffix not in self._GREP_EXTS:
+                continue
+            if any(part in self._GREP_SKIP for part in p.parts):
+                continue
+            name = p.stem.lower()
+            score = 0
+            if name in modules:
+                score += 5
+            score += sum(2 for t in terms if t in name)
+            try:
+                head = p.read_text(encoding="utf-8", errors="replace")[:8000].lower()
+            except OSError:
+                continue
+            score += sum(1 for t in terms if t in head)
+            if score > 0:
+                scored.append((score, p))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        out: dict[str, str] = {}
+        for _, p in scored[:limit]:
+            try:
+                rr = read_capped(p.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+            rel = str(p.relative_to(self.project_root))
+            out[rel] = rr.content
+            if rr.was_truncated:
+                self._truncated_source_files.add(rel)
+        return out
+
     def _build_classification_md(self, issue_number: int, c) -> str:
         return (
             f"# Classification: issue #{issue_number}\n\n"
@@ -354,6 +455,26 @@ class BugFixPipeline:
             source_files = self._read_source_files(spec_results)
             if source_files:
                 self._step("Source files read", f"{len(source_files)} files")
+
+            # Fallback: if specs pointed at no real source, grep the repo by the
+            # classification keywords so we never write a fix against unseen code.
+            if len(source_files) < 2:
+                grep_hits = self._grep_source_files(classification)
+                added = 0
+                for path, content in grep_hits.items():
+                    if path not in source_files:
+                        source_files[path] = content
+                        added += 1
+                if added:
+                    self._step(
+                        "Source files via keyword grep (specs were thin)",
+                        f"+{added} file(s)",
+                    )
+            if not source_files:
+                self._step(
+                    "No source files located",
+                    "spec index empty and keyword grep found nothing — fix may be unreliable",
+                )
 
             # ── 5. Load architecture + security + learnings ───────────────────
             arch_spec = self._read_spec_file("architecture.md")
@@ -470,6 +591,9 @@ class BugFixPipeline:
                 test_runner = self.config.testing.backend_runner or "pytest"
                 branch_name = f"fix/issue-{issue_number}-{self._slug(issue.title)}"
 
+                # Snapshot the tree so a failed run can be rolled back cleanly.
+                self._snapshot_tree()
+
                 # Create git branch
                 rc, _ = self._git("checkout", "-b", branch_name)
                 if rc != 0:
@@ -486,7 +610,10 @@ class BugFixPipeline:
                 prev_output = ""
 
                 rejected_changes: list[str] = []
+                from speckit.core.limits import check_cost_budget
                 for attempt in range(1, 4):
+                    # Abort before another expensive write/test cycle if over budget.
+                    check_cost_budget(self.config)
                     self._step(
                         f"Writing code fix (attempt {attempt})",
                         f"{len(source_files)} source file(s)",
@@ -522,6 +649,31 @@ class BugFixPipeline:
                         "Code applied",
                         f"{len(changed_files)} file(s): {', '.join(changed_files[:3])}",
                     )
+
+                    # Generate runnable tests once (attempt 1) so a green run
+                    # actually proves the fix — closes the silent-test-gap.
+                    if attempt == 1:
+                        try:
+                            from speckit.core.agents import generate_tests
+                            self._step("Generating tests for the fix")
+                            test_plan_code = generate_tests(
+                                spec_md=judge_result.final_spec,
+                                code_changes=[
+                                    {"file": c.file, "action": c.action, "content": c.content}
+                                    for c in code_plan.changes
+                                ],
+                                test_runner=code_plan.test_command or test_runner,
+                                language=self.config.primary_language,
+                                config=self.config,
+                                project_root=self.project_root,
+                                mode="fix",
+                            )
+                            test_changed, _ = self._apply_code_changes(test_plan_code)
+                            if test_changed:
+                                changed_files = list(dict.fromkeys(changed_files + test_changed))
+                                self._step("Tests generated", f"{len(test_changed)} test file(s)")
+                        except Exception as e:
+                            self._step("Test generation skipped", str(e))
 
                     # Run tests
                     self._step("Running tests", code_plan.test_command)
@@ -621,12 +773,19 @@ class BugFixPipeline:
                             + "\n".join(f"- {s}" for s in secrets_found),
                         )
 
+                # ── Blast-radius check ─────────────────────────────────────────
+                from speckit.core.limits import check_blast_radius
+                blast_violations = (
+                    check_blast_radius(code_plan.changes, self.config) if code_plan else []
+                )
+
                 # ── PR gate ────────────────────────────────────────────────────
                 # A PR is only opened when EVERY safety gate passes:
                 #   1. tests actually passed (and were not vacuous)
                 #   2. no unsafe/destructive rewrites were rejected
                 #   3. no secrets detected
                 #   4. code review approved (score >= threshold AND no blocking issues)
+                #   5. change is within the blast-radius budget
                 review_approved = code_review.approved if code_review is not None else False
                 pr_blockers: list[str] = []
                 if not (test_result and test_result.passed):
@@ -637,6 +796,8 @@ class BugFixPipeline:
                     pr_blockers.append("secrets detected")
                 if code_review is not None and not review_approved:
                     pr_blockers.append("code review not approved")
+                if blast_violations:
+                    pr_blockers.append("change too large: " + "; ".join(blast_violations))
 
                 if (
                     not pr_blockers
@@ -720,6 +881,12 @@ class BugFixPipeline:
         except Exception as e:
             self._step("PIPELINE FAILED", str(e))
             result.error = str(e)
+            # Leave the user's repo as we found it if we wrote code then failed.
+            try:
+                if self._rollback_tree():
+                    self._step("Rolled back working-tree changes", "repo restored to pre-run state")
+            except Exception:
+                pass
             self._write(
                 "FAILED.md",
                 "# Pipeline failed\n\n"
