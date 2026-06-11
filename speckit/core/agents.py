@@ -68,25 +68,72 @@ class ScanJudgeResult(BaseModel):
     verdict: str   # "good" | "needs-review" | "poor"
 
 
+# ── per-run state (thread-local for webhook concurrency) ────────────────────────
+#
+# The webhook server runs each pipeline in its own daemon thread. Cost log and
+# prompt-cache context are therefore stored per-thread so concurrent runs cannot
+# clobber each other's token accounting or cached prefix. In the single-threaded
+# CLI this behaves identically to a plain module global.
+
+import threading as _threading
+
+_state = _threading.local()
+
+
+def _get_cost_log() -> list[dict]:
+    if not hasattr(_state, "cost_log"):
+        _state.cost_log = []
+    return _state.cost_log
+
+
+def _get_cache_context() -> str:
+    return getattr(_state, "cache_context", "")
+
+
+def _set_cache_context(value: str) -> None:
+    _state.cache_context = value
+
+
 # ── cost tracking ─────────────────────────────────────────────────────────────
 
-_cost_log: list[dict] = []
-
-
 def reset_cost_log() -> None:
-    _cost_log.clear()
+    _get_cost_log().clear()
+
+
+def get_total_tokens() -> int:
+    """Total input+output tokens spent so far in this run (for budget enforcement)."""
+    log = _get_cost_log()
+    return sum(e["input_tokens"] + e["output_tokens"] for e in log)
+
+
+def get_total_cost_usd(
+    input_per_mtok: float = 3.0,
+    output_per_mtok: float = 15.0,
+    cache_read_per_mtok: float = 0.30,
+) -> float:
+    """
+    Approximate USD spend so far this run. Defaults are Claude Sonnet list prices.
+    Cache reads are billed at ~0.1× input.
+    """
+    total = 0.0
+    for e in _get_cost_log():
+        total += e["input_tokens"] / 1_000_000 * input_per_mtok
+        total += e["output_tokens"] / 1_000_000 * output_per_mtok
+        total += e.get("cache_read_tokens", 0) / 1_000_000 * cache_read_per_mtok
+    return total
 
 
 def get_cost_summary_md() -> str:
-    if not _cost_log:
+    cost_log = _get_cost_log()
+    if not cost_log:
         return ""
-    total_in = sum(e["input_tokens"] for e in _cost_log)
-    total_out = sum(e["output_tokens"] for e in _cost_log)
-    total_cache_read = sum(e.get("cache_read_tokens", 0) for e in _cost_log)
-    total_cache_write = sum(e.get("cache_write_tokens", 0) for e in _cost_log)
+    total_in = sum(e["input_tokens"] for e in cost_log)
+    total_out = sum(e["output_tokens"] for e in cost_log)
+    total_cache_read = sum(e.get("cache_read_tokens", 0) for e in cost_log)
+    total_cache_write = sum(e.get("cache_write_tokens", 0) for e in cost_log)
     rows = "\n".join(
         f"| {e['agent']:<32} | {e['input_tokens']:>8,} | {e['output_tokens']:>8,} |"
-        for e in _cost_log
+        for e in cost_log
     )
     cache_line = ""
     if total_cache_read or total_cache_write:
@@ -107,7 +154,6 @@ def get_cost_summary_md() -> str:
 
 # ── pipeline-level prompt cache ───────────────────────────────────────────────
 
-_pipeline_cache_context: str = ""
 _CACHE_MIN_CHARS = 3000  # ~1 024 tokens — Anthropic's minimum cacheable prefix
 
 
@@ -118,10 +164,9 @@ def set_pipeline_cache(
 ) -> None:
     """
     Call once at pipeline start. All subsequent _AnthropicBackend.call() calls
-    within this process will inject this context as a cached first content block,
+    within this thread will inject this context as a cached first content block,
     paying 0.10× on cache hits instead of 1× for every agent call.
     """
-    global _pipeline_cache_context
     parts: list[str] = []
     if arch_spec:
         parts.append(f"## Architecture specification\n{arch_spec[:2000]}")
@@ -129,31 +174,30 @@ def set_pipeline_cache(
         parts.append(f"## Security specification\n{security_spec[:1200]}")
     if learnings:
         parts.append(f"## Global learnings\n{learnings[:800]}")
-    _pipeline_cache_context = "\n\n".join(parts)
+    _set_cache_context("\n\n".join(parts))
 
 
 def clear_pipeline_cache() -> None:
-    global _pipeline_cache_context
-    _pipeline_cache_context = ""
+    _set_cache_context("")
 
 
 def _arch_block(arch: str) -> str:
     """Return formatted arch section for user prompt; empty when pipeline cache is active."""
-    if _pipeline_cache_context:
+    if _get_cache_context():
         return ""
     return f"\n## Architecture specification\n{arch[:2000]}\n"
 
 
 def _sec_block(sec: str) -> str:
     """Return formatted security section; empty when pipeline cache is active."""
-    if _pipeline_cache_context:
+    if _get_cache_context():
         return ""
     return f"\n## Security specification\n{sec[:1200]}\n"
 
 
 def _learnings_block(learnings: str) -> str:
     """Return formatted learnings section; empty when pipeline cache is active."""
-    if _pipeline_cache_context or not learnings:
+    if _get_cache_context() or not learnings:
         return ""
     return f"\n## Global learnings (avoid these mistakes, follow these patterns)\n{learnings[:800]}\n"
 
@@ -241,13 +285,14 @@ class _AnthropicBackend:
 
     def call(self, system: str, user: str, max_tokens: int, _agent: str = "") -> str:
         # Inject pipeline cache as a cacheable first user content block when large enough
-        if _pipeline_cache_context and len(_pipeline_cache_context) >= _CACHE_MIN_CHARS:
+        cache_context = _get_cache_context()
+        if cache_context and len(cache_context) >= _CACHE_MIN_CHARS:
             messages = [{
                 "role": "user",
                 "content": [
                     {
                         "type": "text",
-                        "text": _pipeline_cache_context,
+                        "text": cache_context,
                         "cache_control": {"type": "ephemeral"},
                     },
                     {"type": "text", "text": user.strip()},
@@ -276,7 +321,7 @@ class _AnthropicBackend:
                 "Anthropic API key invalid. "
                 "Fix at console.anthropic.com/api-keys."
             ) from None
-        _cost_log.append({
+        _get_cost_log().append({
             "agent": _agent or "unknown",
             "input_tokens": resp.usage.input_tokens,
             "output_tokens": resp.usage.output_tokens,
@@ -304,7 +349,7 @@ class _GeminiBackend:
         )
         try:
             um = resp.usage_metadata
-            _cost_log.append({
+            _get_cost_log().append({
                 "agent": _agent or "unknown",
                 "input_tokens": um.prompt_token_count or 0,
                 "output_tokens": um.candidates_token_count or 0,
@@ -1079,6 +1124,89 @@ Rules for the JSON:
         changes=changes,
         test_command=data.get("test_command", test_runner),
         summary=data.get("summary", "Code fix applied"),
+    )
+
+
+# ── agent 8b: generate runnable tests ────────────────────────────────────────
+
+def generate_tests(
+    spec_md: str,
+    code_changes: list[dict],
+    test_runner: str,
+    language: str,
+    config: "SpeckitConfig",
+    project_root: Path,
+    mode: str = "fix",  # "fix" | "feature"
+) -> CodePlan:
+    """
+    Generate ACTUAL runnable test files (not a markdown plan) that exercise the
+    code that was just written. Returns a CodePlan whose changes are test files.
+
+    This closes the 'no new tests for new code' gap: every fix/feature ships with
+    tests that assert the new behaviour, so a green run actually proves something.
+    ~4k in / ~2.5k out.
+    """
+    backend = _get_coding_backend(config)
+
+    changes_text = "\n\n".join(
+        f"### {c.get('file', '?')} ({c.get('action', 'modify')})\n"
+        f"```\n{c.get('content', '')[:1800]}\n```"
+        for c in code_changes[:6]
+    ) or "(no code provided)"
+
+    _goal = (
+        "the bug is fixed and does not regress"
+        if mode == "fix" else
+        "every functional requirement and security NFR in the spec is exercised"
+    )
+
+    system = _prompt_override("generate_tests", project_root) or f"""
+You are a QA engineer writing REAL, runnable {language} tests for code that was just written.
+RULES:
+- Write tests that actually import and call the changed code — no pseudo-code.
+- Assert concrete expected values. Prove that {_goal}.
+- Include at least one negative/edge case and, where relevant, one security test.
+- Tests MUST be collectable and runnable by: {test_runner}
+- Put tests in the conventional location for {language} (e.g. tests/ for Python).
+- Return JSON only — no markdown outside the JSON.
+"""
+
+    user = f"""## Spec
+{spec_md[:2500]}
+
+## Code that was written
+{changes_text}
+
+---
+Return JSON with this exact structure:
+{{
+  "changes": [
+    {{
+      "file": "tests/test_something.py",
+      "action": "create",
+      "content": "FULL test file content",
+      "explanation": "what this test proves"
+    }}
+  ],
+  "test_command": "{test_runner}",
+  "summary": "one-line summary of the tests"
+}}"""
+
+    raw = backend.call(system, user, max_tokens=3000, _agent="generate_tests")
+    data = _parse_json_safe(raw)
+    changes = [
+        CodeChange(
+            file=c.get("file", ""),
+            action=c.get("action", "create"),
+            content=c.get("content", ""),
+            explanation=c.get("explanation", ""),
+        )
+        for c in data.get("changes", [])
+    ]
+    return CodePlan(
+        changes=changes,
+        test_command=data.get("test_command", test_runner),
+        summary=data.get("summary", "Tests generated"),
     )
 
 
@@ -2910,3 +3038,89 @@ Return ONLY valid JSON:
     raw = backend.call(system=system, user=user, max_tokens=1800, _agent="detect_ambiguities")
     data = _parse_json_safe(raw)
     return AmbiguityReport(**data)
+
+
+# ── Agent 33: verify_nfr_implementation ────────────────────────────────────────
+
+class NFRCheck(BaseModel):
+    requirement: str   # short name, e.g. "rate limiting", "PII scrubbing", "NF09"
+    satisfied: bool
+    critical: bool     # safety/security/AI-safety NFR whose absence must block a PR
+    evidence: str      # where it's implemented, or why it's judged missing
+
+
+class NFRVerificationResult(BaseModel):
+    checks: list[NFRCheck]
+    missing: list[str]           # all declared-but-absent requirements
+    blocking_missing: list[str]  # critical requirements that are absent → block PR
+    summary: str
+
+
+def verify_nfr_implementation(
+    spec_md: str,
+    code_changes: list[dict],
+    config: "SpeckitConfig",
+    project_root: Path,
+) -> NFRVerificationResult:
+    """
+    Agent 33 — Verify that non-functional requirements DECLARED in the spec are
+    actually IMPLEMENTED in the generated code (not just written down).
+
+    Closes the gap where a spec mandates rate limiting / auth / PII scrubbing /
+    model fallback but the code ships without them. Safety-critical NFRs that are
+    absent are returned in blocking_missing so the pipeline can refuse the PR.
+
+    Structured verification → routed to the fast model. ~4k in / ~800 out.
+    """
+    override = _prompt_override("verify_nfr", project_root)
+
+    changes_text = "\n\n".join(
+        f"### {c.get('file', '?')} ({c.get('action', 'modify')})\n"
+        f"```\n{c.get('content', '')[:1800]}\n```"
+        for c in code_changes[:6]
+    ) or "(no code changes)"
+
+    system = override or (
+        "You are a verification engineer. You are given a spec that declares "
+        "non-functional requirements (NFRs) and the code that was generated to "
+        "implement the feature. Determine, for each NFR that is in scope for this "
+        "code, whether the code ACTUALLY implements it — point to concrete evidence "
+        "in the code, or mark it missing. Do not accept comments or TODOs as "
+        "implementation. Treat these as safety-critical (critical=true): "
+        "authentication, authorization, input validation, rate limiting, secrets via "
+        "environment (no hardcoding), PII scrubbing, prompt-injection protection, "
+        "model fallback, and audit logging. Return JSON only."
+    )
+
+    user = f"""## Spec (contains NFR section)
+{spec_md[:3500]}
+
+## Generated code
+{changes_text}
+
+## Task
+For each NFR the spec declares that is relevant to this code, check whether the
+code implements it. Only include NFRs that this code is responsible for — do not
+flag infrastructure-level NFRs the code cannot satisfy. Return JSON:
+{{
+  "summary": "one-paragraph verdict",
+  "missing": ["requirements declared but absent from the code"],
+  "blocking_missing": ["the subset of missing that are safety-critical"],
+  "checks": [
+    {{
+      "requirement": "short name or NFR id",
+      "satisfied": true|false,
+      "critical": true|false,
+      "evidence": "file/function where implemented, or why judged missing"
+    }}
+  ]
+}}"""
+
+    backend = _get_backend(config, prefer_fast=True)
+    raw = backend.call(system=system, user=user, max_tokens=1200, _agent="verify_nfr_implementation")
+    data = _parse_json_safe(raw)
+    data.setdefault("checks", [])
+    data.setdefault("missing", [])
+    data.setdefault("blocking_missing", [])
+    data.setdefault("summary", "")
+    return NFRVerificationResult(**data)
