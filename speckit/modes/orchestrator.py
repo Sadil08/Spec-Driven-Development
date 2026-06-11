@@ -529,7 +529,11 @@ class OrchestratorPipeline(_PipelineBase):
 
                         # Run tests
                         from speckit.adapters.shell import output_looks_vacuous
-                        runner = ShellRunner(svc.path)
+                        runner = ShellRunner(
+                            svc.path,
+                            sandbox=svc.config.testing.sandbox,
+                            sandbox_image=svc.config.testing.sandbox_image,
+                        )
                         test_ok, test_output = runner.run(code_plan.test_command)
                         if test_ok and output_looks_vacuous(test_output):
                             self._step(f"  [{svc.name}] Tests passed but collected 0 tests — not verified")
@@ -623,6 +627,15 @@ class OrchestratorPipeline(_PipelineBase):
                     blast_violations = check_blast_radius(code_plan.changes, svc.config)
                     if blast_violations:
                         svc_blockers.append("change too large: " + "; ".join(blast_violations))
+                    from speckit.core.policy import evaluate_policy
+                    policy_violations = evaluate_policy(
+                        code_plan.changes, svc.config,
+                        read_original=lambda p, _b=svc.path: (
+                            (_b / p).read_text(encoding="utf-8") if (_b / p).exists() else ""
+                        ),
+                    )
+                    if policy_violations:
+                        svc_blockers.append("policy: " + "; ".join(policy_violations))
                     if not result.services_built.get(svc.name):
                         svc_blockers.append("tests did not pass")
                     if svc_blockers:
