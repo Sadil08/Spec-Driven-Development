@@ -466,14 +466,20 @@ class OrchestratorPipeline(_PipelineBase):
 
                     self._step(f"  [{svc.name}] Writing code")
 
-                    # Gather source files from the service
+                    # Gather source files from the service (full, capped; track truncation)
+                    from speckit.core.file_safety import read_capped, validate_rewrite
                     src_path = svc.path / svc.config.paths.src.lstrip("./")
                     source_files: dict[str, str] = {}
+                    truncated_files: set[str] = set()
                     if src_path.exists():
                         for p in list(src_path.rglob("*"))[:8]:
                             if p.is_file() and p.suffix in {".py", ".ts", ".js", ".go", ".java"}:
                                 try:
-                                    source_files[str(p.relative_to(svc.path))] = p.read_text(encoding="utf-8")
+                                    rel = str(p.relative_to(svc.path))
+                                    rr = read_capped(p.read_text(encoding="utf-8"))
+                                    source_files[rel] = rr.content
+                                    if rr.was_truncated:
+                                        truncated_files.add(rel)
                                 except Exception:
                                     pass
 
@@ -481,6 +487,7 @@ class OrchestratorPipeline(_PipelineBase):
                     previous_output = ""
 
                     code_plan = None
+                    svc_rejected: list[str] = []
                     for attempt in range(1, 4):
                         code_plan = write_code(
                             bug_report_md=spec_md,
@@ -490,17 +497,44 @@ class OrchestratorPipeline(_PipelineBase):
                             project_root=svc.path,
                             previous_test_output=previous_output,
                             mode="feature",
+                            truncated_files=sorted(truncated_files),
                         )
 
-                        # Apply changes
+                        # Apply changes — refusing destructive full-file rewrites
+                        svc_rejected = []
                         for change in code_plan.changes:
+                            if not change.file or not change.content:
+                                continue
                             target = svc.path / change.file
+                            if change.action == "modify" and target.exists():
+                                try:
+                                    original = target.read_text(encoding="utf-8")
+                                except OSError:
+                                    original = ""
+                                ok, reason = validate_rewrite(
+                                    original, change.content, change.file in truncated_files
+                                )
+                                if not ok:
+                                    svc_rejected.append(f"{change.file}: {reason}")
+                                    continue
                             target.parent.mkdir(parents=True, exist_ok=True)
                             target.write_text(change.content, encoding="utf-8")
 
+                        if svc_rejected:
+                            self._step(f"  [{svc.name}] Unsafe rewrite(s) rejected",
+                                       "; ".join(svc_rejected))
+
                         # Run tests
+                        from speckit.adapters.shell import output_looks_vacuous
                         runner = ShellRunner(svc.path)
                         test_ok, test_output = runner.run(code_plan.test_command)
+                        if test_ok and output_looks_vacuous(test_output):
+                            self._step(f"  [{svc.name}] Tests passed but collected 0 tests — not verified")
+                            test_ok = False
+                            previous_output = (
+                                "The test command exited 0 but ran no tests. Add real tests "
+                                "that exercise the changed code, then ensure they pass."
+                            )
                         result.services_built[svc.name] = test_ok
 
                         if test_ok:
@@ -543,10 +577,22 @@ class OrchestratorPipeline(_PipelineBase):
 
                     # ── Secrets scan ──────────────────────────────────────────
                     secrets_found = scan_for_secrets(code_plan.changes)
+
+                    # ── PR gate ───────────────────────────────────────────────
+                    # Open a PR only when all safety gates pass.
+                    svc_blockers: list[str] = []
+                    if svc_rejected:
+                        svc_blockers.append("destructive rewrite(s) blocked")
                     if secrets_found:
+                        svc_blockers.append("secrets detected")
+                    if not code_review.approved:
+                        svc_blockers.append("code review not approved")
+                    if not result.services_built.get(svc.name):
+                        svc_blockers.append("tests did not pass")
+                    if svc_blockers:
                         self._step(
-                            f"  [{svc.name}] SECRETS DETECTED — skipping PR",
-                            "; ".join(secrets_found),
+                            f"  [{svc.name}] PR blocked by safety gate — skipping PR",
+                            "; ".join(svc_blockers),
                         )
                         continue
 
@@ -569,16 +615,12 @@ class OrchestratorPipeline(_PipelineBase):
                         )
                         subprocess.run(["git", "-C", str(svc.path), "push", "-u",
                                         "origin", branch], capture_output=True)
-                        review_note = (
-                            "\n\n⚠️ Code review flagged issues — see `services/"
-                            f"{svc.name}_code_review.md`."
-                            if not code_review.approved else ""
-                        )
                         pr = gh.create_pr(
                             title=f"feat({svc.name}): {feature_name}",
                             body=(
                                 f"Auto-generated by speckit orchestrate.\n\n"
-                                f"{spec_md[:1000]}{review_note}"
+                                f"{spec_md[:1000]}\n\n✅ Code review passed, tests green, "
+                                "no secrets, no destructive rewrites."
                             ),
                             head=branch,
                         )
