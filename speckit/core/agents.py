@@ -409,7 +409,8 @@ class _ClaudeCLIBackend:
             self._cli, "-p",
             "--output-format", "json",
             "--model", self.model,
-            "--max-turns", "1",
+            "--max-turns", "3",
+            "--tools", "",
             "--system-prompt", system.strip(),
         ]
         try:
