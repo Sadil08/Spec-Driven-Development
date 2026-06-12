@@ -110,10 +110,15 @@ class BrownfieldInitPipeline:
         root: Path,
         on_step: Optional[Callable[[str, str], None]] = None,
         force: bool = False,
+        only_services: Optional[list[str]] = None,
     ):
         self.root = root.resolve()
         self.on_step = on_step or (lambda title, detail: None)
         self.force = force
+        # If set, only process services whose directory name is in this list.
+        self.only_services: Optional[list[str]] = (
+            [s.strip() for s in only_services] if only_services else None
+        )
         self._log_lines: list[str] = []
         self._run_dir: Optional[Path] = None
 
@@ -333,6 +338,20 @@ class BrownfieldInitPipeline:
         agent_config = self._load_or_build_config(service_paths[0])
 
         # ── Stages 1–5: Per-service processing ───────────────────────────────
+        if self.only_services:
+            skipped = [p.name for p in service_paths if p.name not in self.only_services]
+            service_paths = [p for p in service_paths if p.name in self.only_services]
+            if not service_paths:
+                available = [p.name for p in result.health.values()] if result.health else \
+                    [p.name for p in self._discover_services()]
+                result.error = (
+                    f"No matching services for --service filter {self.only_services}. "
+                    f"Available: {available}"
+                )
+                return result
+            if skipped:
+                self._step(f"  Skipping (--service filter)", ", ".join(skipped))
+
         for svc_path in service_paths:
             svc_name = svc_path.name
             health = ServiceHealth(name=svc_name, path=svc_path)
