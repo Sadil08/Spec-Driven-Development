@@ -404,6 +404,19 @@ class _ClaudeCLIBackend:
         if cache_context and len(cache_context) >= _CACHE_MIN_CHARS:
             prompt = cache_context + "\n\n" + prompt
 
+        # Prepend a hard "no tools" guard to every system prompt so the model
+        # does not offer to use MCP servers (Google Drive, etc.) instead of
+        # working with the context provided inline.
+        headless_guard = (
+            "IMPORTANT: This is a fully automated headless call. "
+            "You do NOT have access to any tools, MCP servers, or external file systems. "
+            "All necessary information has been provided inline in the user message. "
+            "Answer based ONLY on what is in this prompt. "
+            "Do NOT offer to connect to Google Drive, GitHub, or any external service. "
+            "Do NOT ask the user for anything. Just produce the requested output.\n\n"
+        )
+        full_system = headless_guard + system.strip()
+
         env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
         cmd = [
             self._cli, "-p",
@@ -411,7 +424,8 @@ class _ClaudeCLIBackend:
             "--model", self.model,
             "--max-turns", "3",
             "--tools", "",
-            "--system-prompt", system.strip(),
+            "--disallowedTools", "mcp__claude_ai_Google_Drive__list_files,mcp__claude_ai_Google_Drive__read_file,mcp__claude_ai_Google_Drive__search_files,mcp__claude_ai_Google_Drive__authenticate,mcp__claude_ai_Google_Drive__complete_authentication",
+            "--system-prompt", full_system,
         ]
         try:
             proc = subprocess.run(
