@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 
 import typer
-from dotenv import load_dotenv
+from speckit.commands import load_env
 from rich.console import Console
 
 console = Console(stderr=True)  # MCP uses stdout for JSON-RPC; all UI goes to stderr
@@ -62,7 +62,7 @@ def mcp_command(
         raise typer.Exit(1)
 
     project_root = Path(path).resolve()
-    load_dotenv(project_root / ".env", override=False)
+    load_env(project_root)
 
     # ── validate config exists ────────────────────────────────────────────────
     from speckit.core.config import load_config

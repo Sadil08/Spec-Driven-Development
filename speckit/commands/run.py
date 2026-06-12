@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 
 import typer
-from dotenv import load_dotenv
+from speckit.commands import load_env
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -68,7 +68,7 @@ def run_command(
     project_root = Path(path).resolve()
 
     # Load .env from project root (does not override already-set env vars)
-    load_dotenv(project_root / ".env", override=False)
+    load_env(project_root)
 
     console.print(Panel.fit(
         "[bold white]speckit run[/bold white]\n"

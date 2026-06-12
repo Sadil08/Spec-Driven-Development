@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 
 import typer
-from dotenv import load_dotenv
+from speckit.commands import load_env
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -64,7 +64,7 @@ def brownfield_init_command(
       speckit orchestrate-bug --issue 42
     """
     root = Path(path).resolve()
-    load_dotenv(root / ".env", override=False)
+    load_env(root)
 
     console.print(Panel.fit(
         "[bold white]speckit brownfield-init[/bold white]\n"
