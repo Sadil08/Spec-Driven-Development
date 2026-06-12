@@ -427,24 +427,54 @@ class _ClaudeCLIBackend:
             "--disallowedTools", "mcp__claude_ai_Google_Drive__list_files,mcp__claude_ai_Google_Drive__read_file,mcp__claude_ai_Google_Drive__search_files,mcp__claude_ai_Google_Drive__authenticate,mcp__claude_ai_Google_Drive__complete_authentication",
             "--system-prompt", full_system,
         ]
-        try:
-            proc = subprocess.run(
-                cmd, input=prompt, capture_output=True, text=True,
-                env=env, timeout=900,
-            )
-        except subprocess.TimeoutExpired:
-            raise RuntimeError(f"claude CLI call timed out after 900s (agent: {_agent})") from None
+        _TRANSIENT = (
+            "socket connection was closed",
+            "connection reset",
+            "econnreset",
+            "network error",
+            "fetch failed",
+            "etimedout",
+        )
+        _MAX_RETRIES = 3
+        last_err: str = ""
+        for _attempt in range(_MAX_RETRIES):
+            try:
+                proc = subprocess.run(
+                    cmd, input=prompt, capture_output=True, text=True,
+                    env=env, timeout=900,
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(f"claude CLI call timed out after 900s (agent: {_agent})") from None
 
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()[:500]
-            if "rate limit" in detail.lower() or "usage limit" in detail.lower():
+            if proc.returncode == 0:
+                break
+
+            detail = (proc.stderr or proc.stdout or "").strip()
+            # Check inside JSON result for transient errors
+            try:
+                _d = json.loads(detail)
+                result_text = str(_d.get("result", "")).lower()
+            except Exception:
+                result_text = detail.lower()
+
+            if "rate limit" in result_text or "usage limit" in result_text or "session limit" in result_text:
                 raise RuntimeError(
                     "Claude subscription usage limit reached. "
                     "Wait for the 5-hour window to reset, then re-run — "
                     "completed pipeline artifacts are reused on retry.\n"
-                    f"  CLI said: {detail}"
+                    f"  CLI said: {detail[:300]}"
                 )
-            raise RuntimeError(f"claude CLI failed (exit {proc.returncode}): {detail}")
+
+            if any(t in result_text for t in _TRANSIENT) and _attempt < _MAX_RETRIES - 1:
+                import time as _time
+                wait = 15 * (2 ** _attempt)  # 15s, 30s
+                last_err = detail[:200]
+                _time.sleep(wait)
+                continue
+
+            raise RuntimeError(f"claude CLI failed (exit {proc.returncode}): {detail[:500]}")
+        else:
+            raise RuntimeError(f"claude CLI failed after {_MAX_RETRIES} retries: {last_err}")
 
         try:
             data = json.loads(proc.stdout)
@@ -453,7 +483,13 @@ class _ClaudeCLIBackend:
                 f"claude CLI returned non-JSON output: {proc.stdout[:300]}"
             ) from None
         if data.get("is_error"):
-            raise RuntimeError(f"claude CLI error: {str(data.get('result', ''))[:500]}")
+            result_msg = str(data.get("result", ""))
+            if any(t in result_msg.lower() for t in _TRANSIENT):
+                raise RuntimeError(
+                    f"claude CLI network error (agent: {_agent}). Re-run to retry — "
+                    f"completed artifacts are preserved.\n  Detail: {result_msg[:300]}"
+                )
+            raise RuntimeError(f"claude CLI error: {result_msg[:500]}")
 
         usage = data.get("usage", {}) or {}
         _get_cost_log().append({
