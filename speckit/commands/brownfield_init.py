@@ -40,6 +40,10 @@ def brownfield_init_command(
     force: bool = typer.Option(
         False, "--force", "-f", help="Overwrite existing spec files."
     ),
+    service: list[str] = typer.Option(
+        None, "--service", "-s",
+        help="Only process this service (directory name). Repeat for multiple: -s backend -s frontend.",
+    ),
 ):
     """
     Bootstrap speckit for an existing multi-service codebase (no specs yet).
@@ -71,16 +75,20 @@ def brownfield_init_command(
     console.print()
 
     # ── backend check ─────────────────────────────────────────────────────────
+    from speckit.core.agents import _find_claude_cli
     has_backend = (
-        os.environ.get("GEMINI_VERTEX", "").lower() in ("true", "1", "yes")
+        os.environ.get("SPECKIT_USE_CLAUDE_CLI", "").lower() in ("true", "1", "yes")
+        or os.environ.get("GEMINI_VERTEX", "").lower() in ("true", "1", "yes")
         or os.environ.get("GEMINI_API_KEY", "")
         or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID", "")
         or os.environ.get("ANTHROPIC_API_KEY", "") not in ("", "paste-your-key-here", "sk-ant-...")
+        or bool(_find_claude_cli())
     )
     if not has_backend:
         console.print(
             "  [red]✗[/red]  No LLM backend configured in [cyan].env[/cyan].\n"
-            "  Set [dim]ANTHROPIC_API_KEY=...[/dim] or [dim]GEMINI_VERTEX=true[/dim]"
+            "  Set [dim]ANTHROPIC_API_KEY=...[/dim] or [dim]GEMINI_VERTEX=true[/dim]\n"
+            "  Or use your Claude Pro subscription: [dim]SPECKIT_USE_CLAUDE_CLI=true[/dim]"
         )
         raise typer.Exit(1)
 
@@ -88,6 +96,8 @@ def brownfield_init_command(
         console.print(f"  [red]✗[/red]  Directory not found: [cyan]{root}[/cyan]")
         raise typer.Exit(1)
 
+    if service:
+        console.print(f"  [yellow]⚠[/yellow]  --service filter: only processing [cyan]{', '.join(service)}[/cyan]\n")
     if skip_audit:
         console.print("  [yellow]⚠[/yellow]  Skipping security/scalability/ambiguity audits\n")
     if skip_contracts:
@@ -107,7 +117,7 @@ def brownfield_init_command(
         else:
             console.print(f"  [dim]{title}[/dim]")
 
-    pipeline = BrownfieldInitPipeline(root=root, on_step=_on_step, force=force)
+    pipeline = BrownfieldInitPipeline(root=root, on_step=_on_step, force=force, only_services=service or None)
 
     try:
         result = pipeline.run(skip_audit=skip_audit, skip_contracts=skip_contracts)
