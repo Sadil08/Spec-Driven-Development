@@ -96,9 +96,18 @@ class VectorDBConfig(BaseModel):
 
 class GitHubConfig(BaseModel):
     default_branch: str = "main"
+    # Branch that new fix/feature branches are cut FROM and that PRs target.
+    # Empty = use default_branch. Set to e.g. "development" for a gitflow repo
+    # so generated work branches off development, not main.
+    base_branch: str = ""
     require_spec_update: bool = True
     bug_labels: list[str] = Field(default_factory=lambda: ["bug", "fix-needed"])
     feature_labels: list[str] = Field(default_factory=lambda: ["feature", "enhancement"])
+
+    @property
+    def work_base(self) -> str:
+        """The branch to base new work on (base_branch, else default_branch)."""
+        return self.base_branch or self.default_branch
 
 
 class PathsConfig(BaseModel):

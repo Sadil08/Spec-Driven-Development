@@ -598,13 +598,34 @@ class BugFixPipeline:
                 # Snapshot the tree so a failed run can be rolled back cleanly.
                 self._snapshot_tree()
 
-                # Create git branch
+                # Cut the new branch FROM the configured base (e.g. development),
+                # not from whatever happens to be checked out. Only switch bases
+                # when the tree is clean, so we never carry or clobber edits.
+                base = self.config.github.work_base
+                rc_cur, current = self._git("branch", "--show-current")
+                if current.strip() != base:
+                    if not getattr(self, "_tree_was_clean", True):
+                        self._step(
+                            "Working tree dirty — branching from current HEAD",
+                            f"expected base '{base}', staying on '{current.strip()}'",
+                        )
+                    else:
+                        rc_base, _ = self._git("checkout", base)
+                        if rc_base == 0:
+                            self._step("Checked out base branch", base)
+                        else:
+                            self._step(
+                                "Base branch not found — branching from current HEAD",
+                                f"'{base}' missing; using '{current.strip()}'",
+                            )
+
+                # Create git branch from the (now correct) base
                 rc, _ = self._git("checkout", "-b", branch_name)
                 if rc != 0:
                     # Branch may already exist
                     self._git("checkout", branch_name)
                 result.branch = branch_name
-                self._step("Branch created", branch_name)
+                self._step("Branch created", f"{branch_name} (from {base})")
 
                 # Retry loop: write code → run tests (up to 3 attempts)
                 shell = ShellAdapter(
@@ -855,7 +876,7 @@ class BugFixPipeline:
                         title=f"fix(#{issue_number}): {issue.title}",
                         body=pr_body,
                         head=branch_name,
-                        base=self.config.github.default_branch,
+                        base=self.config.github.work_base,
                     )
                     result.pr_url = pr.get("html_url", "")
                     self._step("PR opened", result.pr_url)
