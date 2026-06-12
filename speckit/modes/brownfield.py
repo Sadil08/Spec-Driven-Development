@@ -265,6 +265,7 @@ class BrownfieldInitPipeline:
         pkg = pkg_map.get(language, "—")
         config_path.write_text(
             f"project_name: {svc_name}\n"
+            f"mode: brownfield-with-specs\n"
             f"primary_language: {language.lower()}\n"
             f"package_manager: {pkg}\n"
             f"repo: \"\"\n\n"
