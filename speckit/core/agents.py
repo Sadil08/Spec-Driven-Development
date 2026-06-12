@@ -1688,7 +1688,7 @@ def judge_feature_spec(
     dim_count = "seven" if is_ai else "six"
 
     user = f"""{_arch_block(architecture_spec) or f"## Architecture specification\n{architecture_spec[:2000]}\n"}{_sec_block(security_spec) or f"## Security specification\n{security_spec[:1200]}\n"}## Feature spec to review
-{feature_spec_md[:2500]}
+{feature_spec_md[:8000]}
 
 ---
 Score on {dim_count} dimensions (0-1 each, equal weight):
@@ -1724,33 +1724,43 @@ def refine_feature_spec(
     judge_score: JudgeScore,
     config: "SpeckitConfig",
     project_root: Path,
+    iteration: int = 1,
+    resolved_gaps: list[str] | None = None,
 ) -> str:
-    """~3 000 input / ~2 500 output tokens."""
+    """~4 000 input / ~4 000 output tokens."""
     backend = _get_backend(config)
 
     system = _prompt_override("refine_feature", project_root) or """
 You are a product engineer improving a feature spec based on reviewer feedback.
 RULES:
-- Address every gap listed — do not skip any.
-- Do not remove sections that were already good.
-- Return the complete revised feature spec in markdown (all sections present).
-- No preamble, no explanation outside the document.
+- Address EVERY gap listed under "New gaps" — do not skip any.
+- Do NOT remove or shorten sections that were already good.
+- Do NOT reintroduce gaps listed under "Already resolved".
+- Return the COMPLETE revised feature spec in markdown (every section present and fully written).
+- No preamble, no explanation outside the document itself.
 """
 
-    gaps_text = "\n".join(f"- {g}" for g in judge_score.gaps)
+    new_gaps_text = "\n".join(f"- {g}" for g in judge_score.gaps)
+    resolved_text = (
+        "\n".join(f"- {g}" for g in resolved_gaps)
+        if resolved_gaps else "None yet."
+    )
 
-    user = f"""## Current feature spec (score: {judge_score.score:.2f})
+    user = f"""## Iteration {iteration} — feature spec to improve (current score: {judge_score.score:.2f}, target: {config.agent.judge_threshold:.2f})
 {feature_spec_md}
 
-## Gaps to address
-{gaps_text}
+## New gaps to fix (ALL must be addressed)
+{new_gaps_text}
 
-## Reviewer feedback
+## Reviewer guidance
 {judge_score.feedback}
 
-Return the complete improved feature spec (maintain all sections, improve weak ones)."""
+## Already-resolved gaps (do NOT reintroduce these)
+{resolved_text}
 
-    return backend.call(system, user, max_tokens=3000, _agent="refine_feature_spec")
+Return the COMPLETE improved feature spec. Every section must be fully written — no TODOs, no truncation."""
+
+    return backend.call(system, user, max_tokens=5000, _agent="refine_feature_spec")
 
 
 # ── agent 14: write build plan ───────────────────────────────────────────────
