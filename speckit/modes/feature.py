@@ -243,14 +243,27 @@ class FeaturePipeline:
             result.artifacts.append("02_compatibility.md")
 
             # ── 4. Draft + judge loop (skip if already approved) ──────────────
+            _existing_spec = self._load_artifact("03_feature_spec.md") or ""
+            _single_pass = self.config.agent.max_judge_iterations <= 1
             if self._artifact_approved("03_feature_spec.md"):
-                spec = self._load_artifact("03_feature_spec.md") or ""
+                spec = _existing_spec
                 import re as _re
                 _s = _re.search(r"score:\s*([\d.]+)", spec)
                 result.judge_score = float(_s.group(1)) if _s else self.config.agent.judge_threshold
                 result.judge_iterations = 0
                 result.approved = True
                 self._step("Reusing approved spec", "03_feature_spec.md")
+                result.artifacts.append("03_feature_spec.md")
+            elif _single_pass and "needs-human-review" in _existing_spec:
+                # Single-pass mode: a finalized (judged-once) spec already exists.
+                # Reuse it so a rerun after a later-stage hang doesn't redraft.
+                spec = _existing_spec
+                import re as _re
+                _s = _re.search(r"score:\s*([\d.]+)", spec)
+                result.judge_score = float(_s.group(1)) if _s else 0.0
+                result.judge_iterations = 1
+                result.approved = False
+                self._step("Reusing judged spec (single-pass)", "03_feature_spec.md")
                 result.artifacts.append("03_feature_spec.md")
             else:
                 import json as _json
@@ -381,29 +394,23 @@ class FeaturePipeline:
                         gaps=[],
                     )
 
-            # ── 6. Test plan (reused if present; only generated once approved) ─
+            # ── 6. Test plan (reused if present so a rerun never regenerates) ──
             if self._load_artifact("04_test_plan.md"):
                 self._step("Reusing existing test plan", "04_test_plan.md")
-                result.artifacts.append("04_test_plan.md")
-            elif result.approved:
+            else:
                 self._step("Writing test plan")
                 test_plan = write_test_plan(spec, self.config, self.project_root)
                 self._write("04_test_plan.md", test_plan)
-                result.artifacts.append("04_test_plan.md")
-            else:
-                self._step("Skipping test plan", "spec needs human review first")
+            result.artifacts.append("04_test_plan.md")
 
             # ── 7. Build plan ─────────────────────────────────────────────────
             if self._load_artifact("05_build_plan.md"):
                 self._step("Reusing existing build plan", "05_build_plan.md")
-                result.artifacts.append("05_build_plan.md")
-            elif result.approved:
+            else:
                 self._step("Writing build plan")
                 build_plan = write_build_plan(spec, arch_spec, self.config, self.project_root)
                 self._write("05_build_plan.md", build_plan)
-                result.artifacts.append("05_build_plan.md")
-            else:
-                self._step("Skipping build plan", "spec needs human review first")
+            result.artifacts.append("05_build_plan.md")
 
             # ── 8. Spec sync (create new module spec for the feature) ─────────
             if result.approved:
