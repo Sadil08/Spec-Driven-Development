@@ -55,6 +55,13 @@ def run_command(
         "--coding-backend",
         help="Backend for code writing: auto | anthropic | gemini | vertex.",
     ),
+    context: list[str] = typer.Option(
+        None,
+        "--context",
+        "-c",
+        help="File(s) to feed in as extra context, e.g. a feature build plan: "
+             "-c runs/feature-x/05_build_plan.md. Repeat for multiple.",
+    ),
 ):
     """
     Run the full spec-driven bug-fix pipeline for a GitHub issue.
@@ -164,6 +171,23 @@ def run_command(
         )
         console.print()
 
+    # ── gather extra context files (e.g. a feature build plan) ────────────────
+    extra_context = ""
+    if context:
+        parts: list[str] = []
+        for raw_path in context:
+            cpath = Path(raw_path)
+            if not cpath.is_absolute():
+                cpath = project_root / raw_path
+            if cpath.exists():
+                parts.append(f"### {cpath.name}\n{cpath.read_text(encoding='utf-8')}")
+                console.print(f"  [green]✓[/green]  Context loaded  [dim]{raw_path}[/dim]")
+            else:
+                console.print(f"  [yellow]⚠[/yellow]  Context file not found: [cyan]{raw_path}[/cyan]")
+        extra_context = "\n\n".join(parts)
+        if extra_context:
+            console.print()
+
     # ── run pipeline ──────────────────────────────────────────────────────────
     from speckit.modes.bug_fix import BugFixPipeline
 
@@ -175,7 +199,7 @@ def run_command(
     )
 
     try:
-        result = pipeline.run(issue_number=issue, issue=issue_obj)
+        result = pipeline.run(issue_number=issue, issue=issue_obj, extra_context=extra_context)
     except Exception as e:
         err = str(e)
         if "401" in err:

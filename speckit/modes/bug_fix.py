@@ -392,12 +392,17 @@ class BugFixPipeline:
         self,
         issue_number: int,
         issue: Optional["Issue"] = None,
+        extra_context: str = "",
     ) -> RunResult:
         """
         Run the full bug-fix pipeline.
 
         If `issue` is provided, GitHub fetch is skipped — useful for
         --no-github mode where the user enters issue details manually.
+
+        `extra_context` is appended to the issue body so external artifacts
+        (e.g. a feature build plan or spec) guide classification and code
+        generation. The pipeline still grounds itself in specs/ and source.
         """
         from speckit.core.agents import (
             draft_bug_report, write_test_plan, reset_cost_log, get_cost_summary_md,
@@ -434,6 +439,13 @@ class BugFixPipeline:
             if issue is None:
                 self._step("Fetching issue from GitHub")
                 issue = self._fetch_issue(issue_number)
+            if extra_context.strip():
+                issue.body = (
+                    (issue.body or "")
+                    + "\n\n## Additional context (provided artifacts)\n"
+                    + extra_context.strip()
+                )
+                self._step("Added extra context", f"{len(extra_context)} chars")
             self._step("Issue loaded", f"{issue.title!r}")
 
             # ── 2. Classify ──────────────────────────────────────────────────
