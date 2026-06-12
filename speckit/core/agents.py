@@ -441,10 +441,18 @@ class _ClaudeCLIBackend:
             try:
                 proc = subprocess.run(
                     cmd, input=prompt, capture_output=True, text=True,
-                    env=env, timeout=900,
+                    env=env, timeout=600,
                 )
             except subprocess.TimeoutExpired:
-                raise RuntimeError(f"claude CLI call timed out after 900s (agent: {_agent})") from None
+                # A hung CLI process is usually a transient network stall — a
+                # fresh attempt typically completes in 1-3 minutes.
+                last_err = f"timed out after 600s (agent: {_agent})"
+                if _attempt < _MAX_RETRIES - 1:
+                    continue
+                raise RuntimeError(
+                    f"claude CLI call timed out after 600s on all "
+                    f"{_MAX_RETRIES} attempts (agent: {_agent})"
+                ) from None
 
             if proc.returncode == 0:
                 break

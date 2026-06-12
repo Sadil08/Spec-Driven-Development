@@ -253,32 +253,54 @@ class FeaturePipeline:
                 self._step("Reusing approved spec", "03_feature_spec.md")
                 result.artifacts.append("03_feature_spec.md")
             else:
-                # ── 4a. Draft feature spec ────────────────────────────────────
-                self._step("Drafting feature spec")
-                draft = write_feature_spec(
-                    feature_name=feature_name,
-                    feature_description=feature_description,
-                    research_md=research_md,
-                    compatibility_md=compat_md,
-                    architecture_spec=arch_spec,
-                    security_spec=sec_spec,
-                    config=self.config,
-                    project_root=self.project_root,
-                )
-                self._write(
-                    "03_feature_spec.md",
-                    draft + "\n\n---\n*status: draft — pending judge*",
-                )
+                import json as _json
+                state_path = run_dir / "judge_state.json"
+
+                # ── 4a. Draft feature spec — or resume a checkpointed loop ────
+                state: dict | None = None
+                if state_path.exists():
+                    try:
+                        state = _json.loads(state_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        state = None
+
+                resolved_gaps: list[str] = []
+                max_iter = self.config.agent.max_judge_iterations
+                if state and state.get("spec"):
+                    spec = state["spec"]
+                    resolved_gaps = list(state.get("resolved_gaps", []))
+                    best_spec = state.get("best_spec") or spec
+                    best_score = float(state.get("best_score", -1.0))
+                    start_iter = min(int(state.get("next_iteration", 1)), max_iter)
+                    self._step("Resuming judge loop from checkpoint", f"iteration {start_iter}")
+                else:
+                    self._step("Drafting feature spec")
+                    spec = write_feature_spec(
+                        feature_name=feature_name,
+                        feature_description=feature_description,
+                        research_md=research_md,
+                        compatibility_md=compat_md,
+                        architecture_spec=arch_spec,
+                        security_spec=sec_spec,
+                        config=self.config,
+                        project_root=self.project_root,
+                    )
+                    self._write(
+                        "03_feature_spec.md",
+                        spec + "\n\n---\n*status: draft — pending judge*",
+                    )
+                    best_spec, best_score = spec, -1.0
+                    start_iter = 1
                 result.artifacts.append("03_feature_spec.md")
 
                 # ── 4b. Judge loop ────────────────────────────────────────────
                 self._step("Starting judge loop", f"threshold={self.config.agent.judge_threshold}")
 
-                spec = draft
                 score_obj = None
-                resolved_gaps: list[str] = []
+                no_improve = 0
+                i = start_iter
 
-                for i in range(1, self.config.agent.max_judge_iterations + 1):
+                for i in range(start_iter, max_iter + 1):
                     score_obj = judge_feature_spec(
                         spec, arch_spec, sec_spec, self.config, self.project_root
                     )
@@ -288,20 +310,49 @@ class FeaturePipeline:
                         f"Judge iteration {i}",
                         f"score={score_obj.score:.2f} | {len(score_obj.gaps)} gap(s)",
                     )
+                    if score_obj.score > best_score:
+                        best_score, best_spec = score_obj.score, spec
+                        no_improve = 0
+                    else:
+                        no_improve += 1
                     if score_obj.approved:
+                        break
+                    # Judge scores are noisy — if two consecutive iterations fail
+                    # to beat the best score, more refinement won't converge.
+                    if no_improve >= 2:
+                        self._step(
+                            "Score not improving — stopping early",
+                            f"keeping best iteration (score={best_score:.2f})",
+                        )
+                        break
+                    if i >= max_iter:
                         break
                     spec = refine_feature_spec(
                         spec, score_obj, self.config, self.project_root,
                         iteration=i,
                         resolved_gaps=resolved_gaps,
                     )
-                    # Track which gaps were addressed so the next iteration
-                    # doesn't re-fix already-resolved issues.
                     resolved_gaps.extend(score_obj.gaps)
+                    # Checkpoint after every refinement: a crash or timeout on a
+                    # later call resumes from here instead of redrafting.
+                    state_path.write_text(_json.dumps({
+                        "next_iteration": i + 1,
+                        "spec": spec,
+                        "resolved_gaps": resolved_gaps,
+                        "best_spec": best_spec,
+                        "best_score": best_score,
+                    }, indent=2), encoding="utf-8")
 
-                result.judge_score = score_obj.score if score_obj else 0.0
-                result.judge_iterations = min(i, self.config.agent.max_judge_iterations)
-                result.approved = score_obj.approved if score_obj else False
+                approved = bool(score_obj and score_obj.approved)
+                if not approved and best_score >= 0:
+                    spec = best_spec  # ship the best-scoring version, not the last
+                result.judge_score = (
+                    score_obj.score if (approved and score_obj) else max(best_score, 0.0)
+                )
+                result.judge_iterations = i
+                result.approved = approved
+                if approved:
+                    state_path.unlink(missing_ok=True)
 
                 status_tag = "judge-approved" if result.approved else "needs-human-review"
                 self._write(
@@ -330,17 +381,29 @@ class FeaturePipeline:
                         gaps=[],
                     )
 
-            # ── 6. Test plan ──────────────────────────────────────────────────
-            self._step("Writing test plan")
-            test_plan = write_test_plan(spec, self.config, self.project_root)
-            self._write("04_test_plan.md", test_plan)
-            result.artifacts.append("04_test_plan.md")
+            # ── 6. Test plan (reused if present; only generated once approved) ─
+            if self._load_artifact("04_test_plan.md"):
+                self._step("Reusing existing test plan", "04_test_plan.md")
+                result.artifacts.append("04_test_plan.md")
+            elif result.approved:
+                self._step("Writing test plan")
+                test_plan = write_test_plan(spec, self.config, self.project_root)
+                self._write("04_test_plan.md", test_plan)
+                result.artifacts.append("04_test_plan.md")
+            else:
+                self._step("Skipping test plan", "spec needs human review first")
 
             # ── 7. Build plan ─────────────────────────────────────────────────
-            self._step("Writing build plan")
-            build_plan = write_build_plan(spec, arch_spec, self.config, self.project_root)
-            self._write("05_build_plan.md", build_plan)
-            result.artifacts.append("05_build_plan.md")
+            if self._load_artifact("05_build_plan.md"):
+                self._step("Reusing existing build plan", "05_build_plan.md")
+                result.artifacts.append("05_build_plan.md")
+            elif result.approved:
+                self._step("Writing build plan")
+                build_plan = write_build_plan(spec, arch_spec, self.config, self.project_root)
+                self._write("05_build_plan.md", build_plan)
+                result.artifacts.append("05_build_plan.md")
+            else:
+                self._step("Skipping build plan", "spec needs human review first")
 
             # ── 8. Spec sync (create new module spec for the feature) ─────────
             if result.approved:
