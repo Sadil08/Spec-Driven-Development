@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 
 import typer
-from dotenv import load_dotenv
+from speckit.commands import load_env
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -53,7 +53,7 @@ def orchestrate_bug_command(
     Requires global.sdd.config.yml at the monorepo root.
     """
     root = Path(path).resolve()
-    load_dotenv(root / ".env", override=False)
+    load_env(root)
 
     if not no_github and issue == 0:
         console.print(

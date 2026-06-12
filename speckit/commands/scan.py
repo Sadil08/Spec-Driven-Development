@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 import typer
-from dotenv import load_dotenv
+from speckit.commands import load_env
 from rich.console import Console
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
@@ -131,7 +131,7 @@ def scan_command(
     src_path = (project_root / src).resolve()
     out_path = (project_root / out).resolve()
 
-    load_dotenv(project_root / ".env", override=False)
+    load_env(project_root)
 
     console.print(Panel.fit(
         "[bold white]speckit scan[/bold white]\n"

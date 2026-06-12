@@ -20,7 +20,7 @@ import os
 from pathlib import Path
 
 import typer
-from dotenv import load_dotenv
+from speckit.commands import load_env
 from rich.console import Console
 from rich.panel import Panel
 
@@ -42,7 +42,7 @@ def serve_command(
     Set GITHUB_WEBHOOK_SECRET in .env to validate webhook payloads.
     """
     project_root = Path(path).resolve()
-    load_dotenv(project_root / ".env", override=False)
+    load_env(project_root)
 
     try:
         import uvicorn  # noqa: F401

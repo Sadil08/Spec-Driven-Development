@@ -26,7 +26,7 @@ import os
 from pathlib import Path
 
 import typer
-from dotenv import load_dotenv
+from speckit.commands import load_env
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -75,7 +75,7 @@ def build_command(
     Requires ANTHROPIC_API_KEY or GEMINI_API_KEY / GEMINI_VERTEX in .env.
     """
     project_root = Path(path).resolve()
-    load_dotenv(project_root / ".env", override=False)
+    load_env(project_root)
 
     console.print(Panel.fit(
         "[bold white]speckit build[/bold white]\n"
