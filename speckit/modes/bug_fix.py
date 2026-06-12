@@ -393,6 +393,7 @@ class BugFixPipeline:
         issue_number: int,
         issue: Optional["Issue"] = None,
         extra_context: str = "",
+        force_code: bool = False,
     ) -> RunResult:
         """
         Run the full bug-fix pipeline.
@@ -595,12 +596,18 @@ class BugFixPipeline:
             result.artifacts.append("03_test_plan.md")
 
             # ── 9-11. Code fix + tests + PR (only if judge approved) ─────────
-            if not judge_result.approved:
+            if not judge_result.approved and not force_code:
                 self._step(
                     "Skipping code phase",
-                    "bug report needs human review before code is written",
+                    "bug report needs human review before code is written "
+                    "(re-run with --force-code to write code anyway)",
                 )
             else:
+                if not judge_result.approved:
+                    self._step(
+                        "Writing code despite low judge score (--force-code)",
+                        f"score={judge_result.final_score:.2f} — review the diff carefully",
+                    )
                 from speckit.core.agents import write_code, CodePlan
                 from speckit.adapters.shell import ShellAdapter
 

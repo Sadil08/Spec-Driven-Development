@@ -62,6 +62,13 @@ def run_command(
         help="File(s) to feed in as extra context, e.g. a feature build plan: "
              "-c runs/feature-x/05_build_plan.md. Repeat for multiple.",
     ),
+    force_code: bool = typer.Option(
+        False,
+        "--force-code",
+        help="Write code even if the bug-report judge did not approve. "
+             "Code still runs through tests + review; commits to a local branch "
+             "for you to inspect. Use for feature work fed via --context.",
+    ),
 ):
     """
     Run the full spec-driven bug-fix pipeline for a GitHub issue.
@@ -199,7 +206,10 @@ def run_command(
     )
 
     try:
-        result = pipeline.run(issue_number=issue, issue=issue_obj, extra_context=extra_context)
+        result = pipeline.run(
+            issue_number=issue, issue=issue_obj,
+            extra_context=extra_context, force_code=force_code,
+        )
     except Exception as e:
         err = str(e)
         if "401" in err:
