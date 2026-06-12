@@ -276,6 +276,7 @@ class FeaturePipeline:
 
                 spec = draft
                 score_obj = None
+                resolved_gaps: list[str] = []
 
                 for i in range(1, self.config.agent.max_judge_iterations + 1):
                     score_obj = judge_feature_spec(
@@ -289,7 +290,14 @@ class FeaturePipeline:
                     )
                     if score_obj.approved:
                         break
-                    spec = refine_feature_spec(spec, score_obj, self.config, self.project_root)
+                    spec = refine_feature_spec(
+                        spec, score_obj, self.config, self.project_root,
+                        iteration=i,
+                        resolved_gaps=resolved_gaps,
+                    )
+                    # Track which gaps were addressed so the next iteration
+                    # doesn't re-fix already-resolved issues.
+                    resolved_gaps.extend(score_obj.gaps)
 
                 result.judge_score = score_obj.score if score_obj else 0.0
                 result.judge_iterations = min(i, self.config.agent.max_judge_iterations)
